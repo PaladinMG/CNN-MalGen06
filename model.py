@@ -381,11 +381,13 @@ class AccurateTissueNet(nn.Module):
 
     @staticmethod
     def probabilities_from_outputs(
-        outputs: dict[str, torch.Tensor],
+            outputs: dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        coarse = outputs["coarse_logits"].softmax(dim=1)
-        muscle_given_parent = outputs["muscle_logits"].sigmoid()
+        coarse = outputs["coarse_logits"].float().softmax(dim=1)
+        muscle_given_parent = outputs["muscle_logits"].float().sigmoid()
+
         parent = coarse[:, 1:2]
+
         return torch.cat(
             [
                 coarse[:, 0:1],
