@@ -142,12 +142,15 @@ python train.py ... \
   --cache-training-images \
   --cache-handcrafted-features \
   --cache-feature-tile-size 1024 \
-  --cache-vram-reserve-gb 10
+  --cache-vram-reserve-gb 10 \
+  --compile-model \
+  --compile-mode reduce-overhead
 ```
 
 The program prints a VRAM estimate before allocating the cache. Feature maps
 are stored as FP16 and require approximately 18 bytes per source pixel, in
-addition to about 3 bytes for RGB and 0.19 bytes for the 1:4 RGB pyramid.
+addition to about 3 bytes for RGB, 2 bytes for the cached mask/boundary
+targets, and 0.19 bytes for the 1:4 RGB pyramid.
 `--cache-feature-tile-size` controls temporary memory during construction, not
 the final cache size. Lower it if cache construction itself runs out of VRAM.
 
@@ -158,6 +161,38 @@ gamma jitter affect only RGB. This can act as useful stain-invariant
 regularization, but compare validation area error both with and without
 `--cache-handcrafted-features` before choosing it for the final model. Image
 and context caching alone does not make this tradeoff.
+
+Cached training now keeps crops as `uint8` until collation, applies color
+jitter to the entire assembled batch, converts all target masks together, and
+computes regional Muscle presence with one batched reduction. This is
+especially important for large batches because it replaces hundreds of small
+GPU launches and pageable CPU-to-GPU transfers.
+
+CUDA training uses fused AdamW and TF32 for remaining FP32 operations by
+default. Disable them only for a controlled comparison with
+`--no-fused-optimizer` or `--no-tf32`. `--compile-model` is optional: it has a
+noticeable warm-up cost during the first steps but can improve steady-state
+throughput on a long run. The epoch log now reports `patches/s`; use this rather
+than GPU percentage as the primary performance comparison.
+
+Do not increase batch size solely to raise the utilization percentage. For the
+default dataset size (two patches per source image), a batch of 256 may produce
+only a handful of optimizer updates per epoch and can reduce segmentation
+accuracy unless the learning-rate schedule and total update count are retuned.
+Choose the largest microbatch that fits comfortably, then compare validation
+area error. Gradient accumulation increases the effective optimization batch
+but does not increase GPU work per forward pass.
+
+On Windows, Task Manager often displays the 3D engine rather than CUDA compute.
+Select the `CUDA` or `Compute_0` graph. On a Linux/SLURM node, monitor:
+
+```bash
+nvidia-smi dmon -s pucm
+```
+
+Sampling-based utilization can remain low when short compute bursts alternate
+with validation and checkpoint work. Rising `patches/s` with unchanged
+validation quality is the meaningful improvement.
 
 Resume an interrupted run:
 
@@ -299,7 +334,8 @@ The SLURM wrapper also accepts cache settings directly:
 ```bash
 sbatch --export=ALL,DATA=/data/tissue/train,VENV=/work/project/.venv,\
 CACHE_TRAINING_IMAGES=1,CACHE_HANDCRAFTED_FEATURES=1,\
-CACHE_VRAM_RESERVE_GB=10 \
+CACHE_VRAM_RESERVE_GB=10,COMPILE_MODEL=1,\
+COMPILE_MODE=reduce-overhead \
 slurm_train.sbatch
 ```
 

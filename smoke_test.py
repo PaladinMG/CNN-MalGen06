@@ -4,9 +4,13 @@ import argparse
 
 import torch
 
-from data import _precompute_handcrafted_features
+from data import _color_jitter_tensor, _precompute_handcrafted_features
 from model import AccurateTissueNet
-from train import complete_loss
+from train import (
+    batched_color_jitter,
+    complete_loss,
+    device_channels_last_collate,
+)
 
 
 def main() -> None:
@@ -38,6 +42,69 @@ def main() -> None:
     if device.type == "cuda":
         local = local.contiguous(memory_format=torch.channels_last)
         context = context.contiguous(memory_format=torch.channels_last)
+
+    jitter_parameters = (
+        (0.91, 1.08, 0.83, 1.11),
+        (1.07, 0.94, 1.18, 0.89),
+    )
+    geometry_codes = (10, 5)
+    cached_samples = []
+    for sample_index, parameters in enumerate(jitter_parameters):
+        cached_rgb = (
+            local[0].mul(255).round().to(torch.uint8) + sample_index
+        ).clamp_max(255)
+        cached_mask = torch.randint(
+            0, 6, (args.size, args.size), dtype=torch.uint8, device=device
+        )
+        cached_samples.append(
+            {
+                "local": cached_rgb,
+                "context": cached_rgb,
+                "mask": cached_mask,
+                "boundary": cached_mask.eq(1).to(torch.uint8),
+                "color_jitter": parameters,
+                "geometry_code": geometry_codes[sample_index],
+                "name": f"cached_{sample_index}",
+            }
+        )
+    cached_batch = device_channels_last_collate(cached_samples)
+    batched_augmented = batched_color_jitter(
+        cached_batch["local"],
+        cached_batch["color_jitter"],
+    )
+    ordered_samples = sorted(
+        cached_samples, key=lambda sample: sample["geometry_code"]
+    )
+
+    def apply_reference_geometry(
+        image: torch.Tensor, code: int
+    ) -> torch.Tensor:
+        if code & 4:
+            image = torch.flip(image, dims=[2])
+        if code & 8:
+            image = torch.flip(image, dims=[1])
+        if code & 3:
+            image = torch.rot90(image, code & 3, dims=(1, 2))
+        return image
+
+    reference_augmented = torch.stack(
+        [
+            _color_jitter_tensor(
+                apply_reference_geometry(
+                    sample["local"], sample["geometry_code"]
+                ),
+                *sample["color_jitter"],
+            )
+            for sample in ordered_samples
+        ]
+    )
+    augmentation_max_error = (
+        batched_augmented.sub(reference_augmented).abs().max().item()
+    )
+    assert augmentation_max_error < 1e-6
+    assert cached_batch["mask"].dtype == torch.long
+    assert cached_batch["boundary"].dtype == torch.float32
+    assert cached_batch["muscle_presence"].shape == (2,)
 
     # Exercise the same tiled, float16 feature-cache path used by training and
     # verify that its values stay close to a direct full-image calculation.
@@ -107,7 +174,8 @@ def main() -> None:
         f"PASS device={device} torch={torch.__version__} "
         f"parameters={parameters:,} loss={loss.item():.5f} "
         f"probability_sum_max_error={maximum_sum_error:.3g} "
-        f"feature_cache_max_error={feature_cache_max_error:.3g}"
+        f"feature_cache_max_error={feature_cache_max_error:.3g} "
+        f"batched_augmentation_max_error={augmentation_max_error:.3g}"
     )
     print(
         "loss_components "

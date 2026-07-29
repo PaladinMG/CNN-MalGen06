@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import math
 import os
 from pathlib import Path
 import random
+import time
 
 import numpy as np
 import torch
@@ -207,46 +209,124 @@ class Metrics:
 
 
 def device_channels_last_collate(
-    samples: list[dict[str, torch.Tensor | str]],
+    samples: list[
+        dict[
+            str,
+            torch.Tensor | str | int | tuple[float, float, float, float],
+        ]
+    ],
 ) -> dict[str, torch.Tensor | list[str]]:
-    """Collate cached CUDA samples directly into channels-last batches."""
-    batch_size = len(samples)
+    """Collate and augment cached CUDA samples with a bounded launch count."""
+    if "geometry_code" in samples[0]:
+        # Sorting is harmless because the training loader is already shuffled.
+        # It makes each transform group a contiguous batch slice, avoiding
+        # hundreds of per-sample index/copy kernels.
+        samples = sorted(samples, key=lambda sample: int(sample["geometry_code"]))
+
     first_local = samples[0]["local"]
     assert isinstance(first_local, torch.Tensor)
-    _, height, width = first_local.shape
 
-    def image_batch(key: str, channels: int) -> torch.Tensor:
-        first = samples[0][key]
-        assert isinstance(first, torch.Tensor)
-        output = torch.empty(
-            (batch_size, channels, height, width),
-            dtype=first.dtype,
-            device=first.device,
-            memory_format=torch.channels_last,
+    def tensor_batch(key: str) -> torch.Tensor:
+        values = [sample[key] for sample in samples]
+        assert all(isinstance(value, torch.Tensor) for value in values)
+        return torch.stack(values)  # type: ignore[arg-type]
+
+    transform_groups: list[tuple[int, int, int]] = []
+    if "geometry_code" in samples[0]:
+        start = 0
+        while start < len(samples):
+            code = int(samples[start]["geometry_code"])
+            end = start + 1
+            while (
+                end < len(samples)
+                and int(samples[end]["geometry_code"]) == code
+            ):
+                end += 1
+            transform_groups.append((start, end, code))
+            start = end
+
+    def apply_geometry(batch: torch.Tensor) -> torch.Tensor:
+        if not transform_groups:
+            return batch
+        transformed = []
+        for start, end, code in transform_groups:
+            part = batch[start:end]
+            if code & 4:
+                part = torch.flip(part, dims=[3])
+            if code & 8:
+                part = torch.flip(part, dims=[2])
+            rotation = code & 3
+            if rotation:
+                part = torch.rot90(part, rotation, dims=(2, 3))
+            transformed.append(part)
+        return torch.cat(transformed, dim=0)
+
+    # Local and context share transformations, so process their six channels
+    # together. The same applies to the two uint8 target channels.
+    rgb = apply_geometry(
+        torch.cat(
+            [tensor_batch("local"), tensor_batch("context")],
+            dim=1,
         )
-        for index, sample in enumerate(samples):
-            value = sample[key]
-            assert isinstance(value, torch.Tensor)
-            output[index].copy_(value)
-        return output
+    )
+    local = rgb[:, :3].contiguous(memory_format=torch.channels_last)
+    context = rgb[:, 3:].contiguous(memory_format=torch.channels_last)
+    raw_mask = torch.stack(
+        [sample["mask"] for sample in samples]  # type: ignore[list-item]
+    )
+    raw_boundary = torch.stack(
+        [sample["boundary"] for sample in samples]  # type: ignore[list-item]
+    )
+    targets = apply_geometry(
+        torch.stack([raw_mask, raw_boundary], dim=1)
+    )
+    mask = targets[:, 0].long()
+    boundary = targets[:, 1].float()
 
     result: dict[str, torch.Tensor | list[str]] = {
-        "local": image_batch("local", 3),
-        "context": image_batch("context", 3),
-        "mask": torch.stack(
-            [sample["mask"] for sample in samples]  # type: ignore[list-item]
-        ),
-        "boundary": torch.stack(
-            [sample["boundary"] for sample in samples]  # type: ignore[list-item]
-        ),
-        "muscle_presence": torch.stack(
-            [sample["muscle_presence"] for sample in samples]  # type: ignore[list-item]
-        ),
+        "local": local,
+        "context": context,
+        "mask": mask,
+        "boundary": boundary,
+        "muscle_presence": mask.eq(3).flatten(1).any(1).float(),
         "name": [str(sample["name"]) for sample in samples],
     }
     if "handcrafted" in samples[0]:
-        result["handcrafted"] = image_batch("handcrafted", 9)
+        result["handcrafted"] = apply_geometry(
+            tensor_batch("handcrafted")
+        ).contiguous(memory_format=torch.channels_last)
+    if "color_jitter" in samples[0]:
+        result["color_jitter"] = torch.tensor(
+            [sample["color_jitter"] for sample in samples],
+            dtype=torch.float32,
+            device=first_local.device,
+        )
     return result
+
+
+def batched_color_jitter(
+    image: torch.Tensor,
+    parameters: torch.Tensor,
+) -> torch.Tensor:
+    """Apply independent photometric augmentation to an assembled CUDA batch."""
+    if image.ndim != 4 or parameters.shape != (image.shape[0], 4):
+        raise ValueError(
+            "Expected image [N,3,H,W] and jitter parameters [N,4], "
+            f"received {tuple(image.shape)} and {tuple(parameters.shape)}"
+        )
+    brightness, contrast, saturation, gamma = (
+        parameters[:, index, None, None, None] for index in range(4)
+    )
+    image = image.float().div_(255.0).mul_(brightness)
+    channel_mean = image.mean(dim=(2, 3), keepdim=True)
+    image = (image - channel_mean).mul_(contrast).add_(channel_mean)
+    gray = (
+        0.2126 * image[:, 0:1]
+        + 0.7152 * image[:, 1:2]
+        + 0.0722 * image[:, 2:3]
+    )
+    image = gray + saturation * (image - gray)
+    return image.clamp_(0, 1).pow_(gamma).clamp_(0, 1)
 
 
 def make_loader(
@@ -298,6 +378,11 @@ def run_epoch(
     for batch_index, batch in enumerate(loader):
         local = batch["local"].to(device, non_blocking=True)
         context = batch["context"].to(device, non_blocking=True)
+        color_jitter = batch.get("color_jitter")
+        if color_jitter is not None:
+            color_jitter = color_jitter.to(device, non_blocking=True)
+            local = batched_color_jitter(local, color_jitter)
+            context = batched_color_jitter(context, color_jitter)
         if device.type == "cuda":
             local = local.contiguous(memory_format=torch.channels_last)
             context = context.contiguous(memory_format=torch.channels_last)
@@ -423,6 +508,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help=(
+            "Compile the model with torch.compile. CUDA startup is slower, "
+            "but steady-state Python/kernel overhead can be lower."
+        ),
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--no-fused-optimizer",
+        action="store_true",
+        help="Disable the fused CUDA AdamW implementation.",
+    )
+    parser.add_argument(
+        "--no-tf32",
+        action="store_true",
+        help="Disable TensorFloat-32 for remaining FP32 CUDA operations.",
+    )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--class-weights", type=float, nargs=6)
     parser.add_argument("--output", type=Path, default=Path("best_model.pt"))
@@ -469,9 +577,20 @@ def main() -> None:
     amp = device.type == "cuda" and not args.no_amp
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        tf32_enabled = not args.no_tf32
+        torch.backends.cuda.matmul.allow_tf32 = tf32_enabled
+        torch.backends.cudnn.allow_tf32 = tf32_enabled
+        torch.set_float32_matmul_precision(
+            "high" if tf32_enabled else "highest"
+        )
     else:
+        if args.compile_model:
+            raise RuntimeError("--compile-model is currently supported only on CUDA")
         torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "8")))
-    print(f"Using device={device}, AMP={amp}")
+    print(
+        f"Using device={device}, AMP={amp}, "
+        f"TF32={device.type == 'cuda' and not args.no_tf32}"
+    )
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
 
@@ -543,6 +662,7 @@ def main() -> None:
             f"RGB={cache_sizes['rgb'] / 1024 ** 3:.2f} GiB, "
             f"context pyramid={cache_sizes['context'] / 1024 ** 3:.2f} GiB, "
             f"features={cache_sizes['features'] / 1024 ** 3:.2f} GiB, "
+            f"targets={cache_sizes['targets'] / 1024 ** 3:.2f} GiB, "
             f"total={cache_bytes / 1024 ** 3:.2f} GiB"
         )
 
@@ -619,6 +739,21 @@ def main() -> None:
     val_loader = make_loader(
         val_dataset, args.batch_size, args.workers, False, device.type == "cuda"
     )
+    optimizer_updates = math.ceil(
+        len(train_loader) / args.accumulation_steps
+    )
+    print(
+        f"Training workload: {len(train_dataset):,} patches, "
+        f"{len(train_loader):,} batches/epoch, "
+        f"batch size={args.batch_size}, "
+        f"{optimizer_updates:,} optimizer updates/epoch"
+    )
+    if optimizer_updates < 25:
+        print(
+            "Warning: fewer than 25 optimizer updates per epoch. A very large "
+            "batch can reduce accuracy unless total updates and the learning-"
+            "rate schedule are retuned."
+        )
 
     model_configuration = (
         resume_checkpoint["model_config"]
@@ -653,6 +788,7 @@ def main() -> None:
             {"params": other_parameters, "lr": args.lr},
         ],
         weight_decay=args.weight_decay,
+        fused=device.type == "cuda" and not args.no_fused_optimizer,
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", patience=6, factor=0.5, min_lr=1e-7
@@ -675,9 +811,19 @@ def main() -> None:
         print(f"Resumed {args.resume} at epoch {start_epoch}")
         del resume_checkpoint
 
+    if args.compile_model:
+        model.compile(mode=args.compile_mode)
+        print(
+            f"Enabled torch.compile mode={args.compile_mode}; the first "
+            "training steps will include compilation time."
+        )
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.last_output.parent.mkdir(parents=True, exist_ok=True)
     for epoch in range(start_epoch, args.epochs + 1):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_started = time.perf_counter()
         train_result = run_epoch(
             model,
             train_loader,
@@ -689,6 +835,10 @@ def main() -> None:
             accumulation_steps=args.accumulation_steps,
             gradient_clip=args.gradient_clip,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        train_seconds = time.perf_counter() - train_started
+        patches_per_second = len(train_dataset) / max(train_seconds, 1e-9)
         with torch.inference_mode():
             val_result = run_epoch(
                 model,
@@ -706,7 +856,9 @@ def main() -> None:
         )
         print(
             f"{epoch:03d}/{args.epochs} train loss={train_loss:.4f} "
-            f"mIoU={train_iou:.3f} | val loss={val_loss:.4f} "
+            f"mIoU={train_iou:.3f} "
+            f"speed={patches_per_second:.1f} patches/s | "
+            f"val loss={val_loss:.4f} "
             f"mIoU={val_iou:.3f} boundaryF1={boundary_f1:.3f}"
         )
         print(f"  IoU: {class_summary}")

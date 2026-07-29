@@ -23,6 +23,8 @@ CACHE_TRAINING_IMAGES="${CACHE_TRAINING_IMAGES:-0}"
 CACHE_HANDCRAFTED_FEATURES="${CACHE_HANDCRAFTED_FEATURES:-0}"
 CACHE_VRAM_RESERVE_GB="${CACHE_VRAM_RESERVE_GB:-10}"
 CACHE_FEATURE_TILE_SIZE="${CACHE_FEATURE_TILE_SIZE:-1024}"
+COMPILE_MODEL="${COMPILE_MODEL:-0}"
+COMPILE_MODE="${COMPILE_MODE:-reduce-overhead}"
 
 if [[ -n "${MODULES:-}" ]]; then
     module load ${MODULES}
@@ -62,6 +64,9 @@ if [[ "${CACHE_HANDCRAFTED_FEATURES}" == "1" ]]; then
         exit 2
     fi
     ARGS+=(--cache-handcrafted-features)
+fi
+if [[ "${COMPILE_MODEL}" == "1" ]]; then
+    ARGS+=(--compile-model --compile-mode "${COMPILE_MODE}")
 fi
 if [[ -n "${EXTRA_ARGS:-}" ]]; then
     read -r -a USER_ARGS <<< "${EXTRA_ARGS}"

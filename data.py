@@ -100,6 +100,7 @@ def _extract_centered_tensor(
     center_y: int,
     center_x: int,
     size: int,
+    constant_value: float | None = None,
 ) -> torch.Tensor:
     _, height, width = tensor.shape
 
@@ -121,18 +122,25 @@ def _extract_centered_tensor(
     crop = tensor[:, top:bottom, left:right]
 
     if pad_top or pad_bottom or pad_left or pad_right:
-        crop = F.pad(
-            crop,
-            (
-                pad_left,
-                pad_right,
-                pad_top,
-                pad_bottom,
-            ),
-            mode="replicate",
+        padding = (
+            pad_left,
+            pad_right,
+            pad_top,
+            pad_bottom,
         )
+        if constant_value is None:
+            crop = F.pad(crop, padding, mode="replicate")
+        else:
+            crop = F.pad(
+                crop,
+                padding,
+                mode="constant",
+                value=constant_value,
+            )
 
-    return crop.contiguous()
+    # In-bounds crops remain views. The collate function copies them directly
+    # into the final channels-last batch, avoiding a per-sample allocation.
+    return crop
 
 def _color_jitter_tensor(
     image: torch.Tensor,
@@ -194,6 +202,7 @@ def estimate_training_cache_bytes(
     rgb_bytes = 0
     context_bytes = 0
     feature_bytes = 0
+    target_bytes = 0
     for image_path, _ in samples:
         with Image.open(image_path) as image:
             width, height = image.size
@@ -205,11 +214,15 @@ def estimate_training_cache_bytes(
             context_bytes += context_height * context_width * 3
         if include_handcrafted_features:
             feature_bytes += pixels * 9 * 2  # cached as float16
+        # One uint8 class mask and one uint8 Bone/Fibro boundary map. The CPU
+        # mask remains available for inexpensive class-aware center sampling.
+        target_bytes += pixels * 2
     return {
         "rgb": rgb_bytes,
         "context": context_bytes,
         "features": feature_bytes,
-        "total": rgb_bytes + context_bytes + feature_bytes,
+        "targets": target_bytes,
+        "total": rgb_bytes + context_bytes + feature_bytes + target_bytes,
     }
 
 
@@ -299,6 +312,7 @@ class SegmentationDataset(Dataset):
 
         self.cached_images = None
         self.cached_masks = None
+        self.cached_device_masks = None
         self.cached_context_images = None
         self.cached_handcrafted = None
         self.cached_boundaries = None
@@ -308,6 +322,7 @@ class SegmentationDataset(Dataset):
         if self.cache_device is not None:
             self.cached_images = []
             self.cached_masks = []
+            self.cached_device_masks = []
             self.cached_context_images = []
             self.cached_handcrafted = [] if cache_handcrafted_features else None
             self.cached_boundaries = []
@@ -376,10 +391,23 @@ class SegmentationDataset(Dataset):
                     ).contiguous()
                 self.cached_context_images.append(context_tensor)
 
-                # Keep mask in CPU RAM initially.
+                # Retain a CPU copy for class-aware center sampling, while the
+                # device copy eliminates one pageable host transfer per patch.
                 self.cached_masks.append(mask)
+                self.cached_device_masks.append(
+                    torch.from_numpy(mask)
+                    .unsqueeze(0)
+                    .contiguous()
+                    .to(self.cache_device)
+                )
                 full_boundary = bone_fibro_boundary(mask, width=3)
-                self.cached_boundaries.append(full_boundary)
+                self.cached_boundaries.append(
+                    torch.from_numpy(full_boundary)
+                    .to(torch.uint8)
+                    .unsqueeze(0)
+                    .contiguous()
+                    .to(self.cache_device)
+                )
                 boundary_coordinates = np.column_stack(
                     np.nonzero(bone_fibro_boundary(mask, width=1))
                 ).astype(np.int32, copy=False)
@@ -471,12 +499,18 @@ class SegmentationDataset(Dataset):
 
         return random.randrange(height), random.randrange(width)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def __getitem__(
+        self, index: int
+    ) -> dict[
+        str,
+        torch.Tensor | str | int | tuple[float, float, float, float],
+    ]:
         sample_index, patch_number = divmod(index, self.patches_per_image)
         image_path, mask_path = self.samples[sample_index]
         if self.cached_images is not None:
             image = self.cached_images[sample_index]
             mask = self.cached_masks[sample_index]
+            device_mask = self.cached_device_masks[sample_index]
             context_pyramid = self.cached_context_images[sample_index]
             full_boundary = self.cached_boundaries[sample_index]
             full_handcrafted = (
@@ -505,6 +539,7 @@ class SegmentationDataset(Dataset):
                     copy=True,
                 )
             context_pyramid = None
+            device_mask = None
             full_boundary = None
             full_handcrafted = None
         if self.cached_images is None:
@@ -534,13 +569,22 @@ class SegmentationDataset(Dataset):
             self.crop_size,
         )
 
-        local_mask = _extract_centered(
-            mask,
-            center_y,
-            center_x,
-            self.crop_size,
-            constant_value=BACKGROUND_ID,
-        )
+        if device_mask is not None:
+            local_mask = _extract_centered_tensor(
+                device_mask,
+                center_y,
+                center_x,
+                self.crop_size,
+                constant_value=BACKGROUND_ID,
+            )
+        else:
+            local_mask = _extract_centered(
+                mask,
+                center_y,
+                center_x,
+                self.crop_size,
+                constant_value=BACKGROUND_ID,
+            )
 
         if context_pyramid is not None:
             image_height, image_width = image.shape[-2:]
@@ -582,64 +626,72 @@ class SegmentationDataset(Dataset):
             else None
         )
         boundary = (
-            _extract_centered(
+            _extract_centered_tensor(
                 full_boundary,
                 center_y,
                 center_x,
                 self.crop_size,
                 constant_value=0,
-            ).astype(np.float32)
+            )
             if full_boundary is not None
             else None
         )
 
+        color_jitter = None
+        geometry_code = None
         if self.augment:
-            if random.random() < 0.5:
-                local = torch.flip(local, dims=[2])
-                context = torch.flip(context, dims=[2])
-                if handcrafted is not None:
-                    handcrafted = torch.flip(handcrafted, dims=[2])
-                local_mask = local_mask[:, ::-1].copy()
-                if boundary is not None:
-                    boundary = boundary[:, ::-1].copy()
-            if random.random() < 0.5:
-                local = torch.flip(local, dims=[1])
-                context = torch.flip(context, dims=[1])
-                if handcrafted is not None:
-                    handcrafted = torch.flip(handcrafted, dims=[1])
-                local_mask = local_mask[::-1, :].copy()
-                if boundary is not None:
-                    boundary = boundary[::-1, :].copy()
+            flip_horizontal = random.random() < 0.5
+            flip_vertical = random.random() < 0.5
             rotation = random.randrange(4)
-            local = torch.rot90(local, rotation, dims=(1, 2))
-            context = torch.rot90(context, rotation, dims=(1, 2))
-            if handcrafted is not None:
-                handcrafted = torch.rot90(
-                    handcrafted, rotation, dims=(1, 2)
+            if self.cache_device is not None:
+                # Defer geometric augmentation so samples sharing the same
+                # transform can be processed together after collation.
+                geometry_code = (
+                    rotation
+                    | (int(flip_horizontal) << 2)
+                    | (int(flip_vertical) << 3)
                 )
-            local_mask = np.rot90(local_mask, rotation).copy()
-            if boundary is not None:
-                boundary = np.rot90(boundary, rotation).copy()
+            else:
+                if flip_horizontal:
+                    local = torch.flip(local, dims=[2])
+                    context = torch.flip(context, dims=[2])
+                    local_mask = local_mask[:, ::-1].copy()
+                if flip_vertical:
+                    local = torch.flip(local, dims=[1])
+                    context = torch.flip(context, dims=[1])
+                    local_mask = local_mask[::-1, :].copy()
+                local = torch.rot90(local, rotation, dims=(1, 2))
+                context = torch.rot90(context, rotation, dims=(1, 2))
+                local_mask = np.rot90(local_mask, rotation).copy()
 
             brightness = random.uniform(0.85, 1.15)
             contrast = random.uniform(0.85, 1.15)
             saturation = random.uniform(0.75, 1.25)
             gamma = random.uniform(0.85, 1.15)
-            local = _color_jitter_tensor(
-                local,
-                brightness,
-                contrast,
-                saturation,
-                gamma,
-            )
-
-            context = _color_jitter_tensor(
-                context,
-                brightness,
-                contrast,
-                saturation,
-                gamma,
-            )
+            if self.cache_device is not None:
+                # Keep cached crops as uint8 and apply all 4 photometric
+                # transforms to the assembled batch in one GPU operation.
+                color_jitter = (
+                    brightness,
+                    contrast,
+                    saturation,
+                    gamma,
+                )
+            else:
+                local = _color_jitter_tensor(
+                    local,
+                    brightness,
+                    contrast,
+                    saturation,
+                    gamma,
+                )
+                context = _color_jitter_tensor(
+                    context,
+                    brightness,
+                    contrast,
+                    saturation,
+                    gamma,
+                )
         else:
             local = local.float().div(255.0)
             context = context.float().div(255.0)
@@ -650,26 +702,31 @@ class SegmentationDataset(Dataset):
                 width=3,
             ).astype(np.float32)
 
-        muscle_presence = np.float32(
-            np.any(local_mask == 3)
-        )
-
-        mask_tensor = torch.from_numpy(local_mask).long()
-        boundary_tensor = torch.from_numpy(boundary)
-        presence_tensor = torch.tensor(muscle_presence)
-        if self.cache_device is not None:
-            mask_tensor = mask_tensor.to(self.cache_device)
-            boundary_tensor = boundary_tensor.to(self.cache_device)
-            presence_tensor = presence_tensor.to(self.cache_device)
+        if isinstance(local_mask, torch.Tensor):
+            # Defer dtype conversion and Muscle-presence reduction until the
+            # full batch has been assembled.
+            mask_tensor = local_mask[0]
+            boundary_tensor = boundary[0]
+            presence_tensor = None
+        else:
+            muscle_presence = np.float32(np.any(local_mask == 3))
+            mask_tensor = torch.from_numpy(local_mask).long()
+            boundary_tensor = torch.from_numpy(boundary)
+            presence_tensor = torch.tensor(muscle_presence)
 
         sample = {
             "local": local,
             "context": context,
             "mask": mask_tensor,
             "boundary": boundary_tensor,
-            "muscle_presence": presence_tensor,
             "name": image_path.stem,
         }
+        if presence_tensor is not None:
+            sample["muscle_presence"] = presence_tensor
         if handcrafted is not None:
             sample["handcrafted"] = handcrafted
+        if color_jitter is not None:
+            sample["color_jitter"] = color_jitter
+        if geometry_code is not None:
+            sample["geometry_code"] = geometry_code
         return sample
