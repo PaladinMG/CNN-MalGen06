@@ -171,7 +171,7 @@ class Metrics:
             - intersection
         )
         valid = union > 0
-        per_class = torch.full((self.classes,), float("nan"))
+        per_class = torch.full_like(intersection, float("nan"))
         per_class[valid] = intersection[valid] / union[valid]
         mean_iou = float(per_class[valid].mean()) if torch.any(valid) else 0.0
         boundary_f1 = (
@@ -450,7 +450,7 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", patience=6, factor=0.5, min_lr=1e-7
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp)
     class_weights = (
         torch.tensor(args.class_weights, device=device)
         if args.class_weights
