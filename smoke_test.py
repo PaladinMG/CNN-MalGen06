@@ -4,6 +4,7 @@ import argparse
 
 import torch
 
+from data import _precompute_handcrafted_features
 from model import AccurateTissueNet
 from train import complete_loss
 
@@ -37,6 +38,33 @@ def main() -> None:
     if device.type == "cuda":
         local = local.contiguous(memory_format=torch.channels_last)
         context = context.contiguous(memory_format=torch.channels_last)
+
+    # Exercise the same tiled, float16 feature-cache path used by training and
+    # verify that its values stay close to a direct full-image calculation.
+    local_uint8 = local[0].mul(255).round().to(torch.uint8)
+    with torch.no_grad():
+        handcrafted = _precompute_handcrafted_features(
+            local_uint8,
+            model.handcrafted,
+            # Force internal tile boundaries even in the smallest smoke test.
+            tile_size=max(16, args.size // 2),
+        ).unsqueeze(0)
+        direct_handcrafted = model.handcrafted(
+            local_uint8.float().div(255.0).unsqueeze(0)
+        )
+    feature_cache_max_error = (
+        handcrafted.float()
+        .sub(direct_handcrafted.float())
+        .abs()
+        .max()
+        .item()
+    )
+    assert feature_cache_max_error < 0.01
+    if device.type == "cpu":
+        # The production cache is CUDA-only, where AMP accepts its FP16
+        # storage. CPU convolution requires the input and weights to match.
+        handcrafted = handcrafted.float()
+
     mask = torch.randint(0, 6, (1, args.size, args.size), device=device)
     boundary = torch.zeros(1, args.size, args.size, device=device)
     boundary[:, :, args.size // 2 - 1 : args.size // 2 + 2] = 1
@@ -47,7 +75,7 @@ def main() -> None:
         dtype=torch.float16,
         enabled=amp,
     ):
-        outputs = model(local, context)
+        outputs = model(local, context, handcrafted)
         loss, components, probabilities = complete_loss(
             model,
             outputs,
@@ -78,7 +106,8 @@ def main() -> None:
     print(
         f"PASS device={device} torch={torch.__version__} "
         f"parameters={parameters:,} loss={loss.item():.5f} "
-        f"probability_sum_max_error={maximum_sum_error:.3g}"
+        f"probability_sum_max_error={maximum_sum_error:.3g} "
+        f"feature_cache_max_error={feature_cache_max_error:.3g}"
     )
     print(
         "loss_components "

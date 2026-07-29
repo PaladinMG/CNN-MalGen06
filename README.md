@@ -119,6 +119,46 @@ If that fits comfortably, try batch size 6 or 8. If it does not, use batch size
 CUDA automatic mixed precision is enabled by default. Use `--no-amp` only for
 diagnosis or a carefully measured precision comparison.
 
+If the source images fit in VRAM after leaving room for the model and its
+activations, cache them for repeated epochs:
+
+```bash
+python train.py ... \
+  --cache-training-images \
+  --cache-vram-reserve-gb 10
+```
+
+This keeps the source RGB images as `uint8`, constructs the 1:4 context
+pyramid only once, reuses precomputed boundary sampling maps, and batches
+cached samples directly in channels-last CUDA memory. Cached mode uses zero
+DataLoader workers because CUDA tensors cannot safely be shared by worker
+processes.
+
+The nine Laplace/deviation/gradient/structure-tensor/Hessian maps can also be
+calculated once per source image:
+
+```bash
+python train.py ... \
+  --cache-training-images \
+  --cache-handcrafted-features \
+  --cache-feature-tile-size 1024 \
+  --cache-vram-reserve-gb 10
+```
+
+The program prints a VRAM estimate before allocating the cache. Feature maps
+are stored as FP16 and require approximately 18 bytes per source pixel, in
+addition to about 3 bytes for RGB and 0.19 bytes for the 1:4 RGB pyramid.
+`--cache-feature-tile-size` controls temporary memory during construction, not
+the final cache size. Lower it if cache construction itself runs out of VRAM.
+
+Feature caching is optional because it changes one augmentation detail:
+geometric transformations remain exactly aligned, but the cached structural
+maps describe the original image while brightness, contrast, saturation, and
+gamma jitter affect only RGB. This can act as useful stain-invariant
+regularization, but compare validation area error both with and without
+`--cache-handcrafted-features` before choosing it for the final model. Image
+and context caching alone does not make this tradeoff.
+
 Resume an interrupted run:
 
 ```bash
@@ -251,6 +291,15 @@ Set `MODULES="cuda/12.4"` if the cluster requires an environment module. Use
 ```bash
 sbatch --export=ALL,DATA=/data/tissue/train,VENV=/work/project/.venv,\
 EXTRA_ARGS="--accumulation-steps 2 --class-weights 1 2 2 3 1 0.3" \
+slurm_train.sbatch
+```
+
+The SLURM wrapper also accepts cache settings directly:
+
+```bash
+sbatch --export=ALL,DATA=/data/tissue/train,VENV=/work/project/.venv,\
+CACHE_TRAINING_IMAGES=1,CACHE_HANDCRAFTED_FEATURES=1,\
+CACHE_VRAM_RESERVE_GB=10 \
 slurm_train.sbatch
 ```
 

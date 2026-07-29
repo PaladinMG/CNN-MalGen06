@@ -16,6 +16,8 @@ import torch.nn.functional as F
 
 from collections.abc import Sequence
 
+from model import HandcraftedFeatures
+
 Image.MAX_IMAGE_PIXELS = None
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 BACKGROUND_ID = 5
@@ -183,6 +185,73 @@ def estimate_rgb_cache_bytes(
 
     return total
 
+
+def estimate_training_cache_bytes(
+    samples: Sequence[tuple[Path, Path]],
+    context_scale: int,
+    include_handcrafted_features: bool,
+) -> dict[str, int]:
+    rgb_bytes = 0
+    context_bytes = 0
+    feature_bytes = 0
+    for image_path, _ in samples:
+        with Image.open(image_path) as image:
+            width, height = image.size
+        pixels = width * height
+        rgb_bytes += pixels * 3
+        if context_scale > 1:
+            context_height = math.ceil(height / context_scale)
+            context_width = math.ceil(width / context_scale)
+            context_bytes += context_height * context_width * 3
+        if include_handcrafted_features:
+            feature_bytes += pixels * 9 * 2  # cached as float16
+    return {
+        "rgb": rgb_bytes,
+        "context": context_bytes,
+        "features": feature_bytes,
+        "total": rgb_bytes + context_bytes + feature_bytes,
+    }
+
+
+@torch.no_grad()
+def _precompute_handcrafted_features(
+    image: torch.Tensor,
+    extractor: HandcraftedFeatures,
+    tile_size: int,
+) -> torch.Tensor:
+    """Calculate full-image maps once with a two-pixel receptive-field halo."""
+    _, height, width = image.shape
+    output = torch.empty(
+        (9, height, width),
+        dtype=torch.float16,
+        device=image.device,
+    )
+    halo = 2
+    for top in range(0, height, tile_size):
+        bottom = min(top + tile_size, height)
+        for left in range(0, width, tile_size):
+            right = min(left + tile_size, width)
+            extended_top = max(0, top - halo)
+            extended_bottom = min(height, bottom + halo)
+            extended_left = max(0, left - halo)
+            extended_right = min(width, right + halo)
+            rgb = image[
+                :,
+                extended_top:extended_bottom,
+                extended_left:extended_right,
+            ].unsqueeze(0)
+            features = extractor(rgb.float().div(255.0))[0]
+            source_top = top - extended_top
+            source_left = left - extended_left
+            output[:, top:bottom, left:right].copy_(
+                features[
+                    :,
+                    source_top : source_top + (bottom - top),
+                    source_left : source_left + (right - left),
+                ]
+            )
+    return output
+
 class SegmentationDataset(Dataset):
     """
     Returns aligned native-resolution local crops, 1:context_scale context crops
@@ -200,6 +269,8 @@ class SegmentationDataset(Dataset):
         patches_per_image: int = 2,
         sample_indices: list[int] | None = None,
         cache_device: torch.device | None = None,
+        cache_handcrafted_features: bool = False,
+        cache_feature_tile_size: int = 1024,
     ) -> None:
         if crop_size <= 0 or crop_size % 32:
             raise ValueError("crop_size must be a positive multiple of 32")
@@ -213,6 +284,12 @@ class SegmentationDataset(Dataset):
         self.class_focus_probability = class_focus_probability
         self.patches_per_image = max(1, patches_per_image)
         self.cache_device = cache_device
+        self.cache_handcrafted_features = cache_handcrafted_features
+        self.cache_feature_tile_size = cache_feature_tile_size
+        if cache_handcrafted_features and cache_device is None:
+            raise ValueError(
+                "cache_handcrafted_features requires a CUDA image cache"
+            )
         all_samples = discover_samples(root)
         self.samples = (
             [all_samples[index] for index in sample_indices]
@@ -222,12 +299,27 @@ class SegmentationDataset(Dataset):
 
         self.cached_images = None
         self.cached_masks = None
+        self.cached_context_images = None
+        self.cached_handcrafted = None
+        self.cached_boundaries = None
+        self.cached_boundary_coordinates = None
+        self.cached_present_classes = None
 
         if self.cache_device is not None:
             self.cached_images = []
             self.cached_masks = []
+            self.cached_context_images = []
+            self.cached_handcrafted = [] if cache_handcrafted_features else None
+            self.cached_boundaries = []
+            self.cached_boundary_coordinates = []
+            self.cached_present_classes = []
+            feature_extractor = (
+                HandcraftedFeatures().to(self.cache_device).eval()
+                if cache_handcrafted_features
+                else None
+            )
 
-            for image_path, mask_path in self.samples:
+            for cache_index, (image_path, mask_path) in enumerate(self.samples):
                 with Image.open(image_path) as image_file:
                     image = np.array(
                         image_file.convert("RGB"),
@@ -242,6 +334,22 @@ class SegmentationDataset(Dataset):
                         copy=True,
                     )
 
+                if mask.ndim != 2:
+                    raise ValueError(
+                        f"{mask_path} must be a single-channel or indexed PNG, "
+                        f"received shape {mask.shape}"
+                    )
+                if image.shape[:2] != mask.shape:
+                    raise ValueError(
+                        f"Image and mask dimensions differ for "
+                        f"{image_path.name}: {image.shape[:2]} versus "
+                        f"{mask.shape}"
+                    )
+                if mask.max() > 5:
+                    raise ValueError(
+                        f"{mask_path} contains class IDs outside 0..5"
+                    )
+
                 image_tensor = (
                     torch.from_numpy(image)
                     .permute(2, 0, 1)
@@ -251,14 +359,53 @@ class SegmentationDataset(Dataset):
 
                 self.cached_images.append(image_tensor)
 
+                if self.context_scale == 1:
+                    context_tensor = image_tensor
+                else:
+                    context_height = math.ceil(
+                        image_tensor.shape[1] / self.context_scale
+                    )
+                    context_width = math.ceil(
+                        image_tensor.shape[2] / self.context_scale
+                    )
+                    context_tensor = TF.resize(
+                        image_tensor,
+                        [context_height, context_width],
+                        interpolation=InterpolationMode.BICUBIC,
+                        antialias=True,
+                    ).contiguous()
+                self.cached_context_images.append(context_tensor)
+
                 # Keep mask in CPU RAM initially.
                 self.cached_masks.append(mask)
+                full_boundary = bone_fibro_boundary(mask, width=3)
+                self.cached_boundaries.append(full_boundary)
+                boundary_coordinates = np.column_stack(
+                    np.nonzero(bone_fibro_boundary(mask, width=1))
+                ).astype(np.int32, copy=False)
+                self.cached_boundary_coordinates.append(boundary_coordinates)
+                self.cached_present_classes.append(np.unique(mask))
+
+                if feature_extractor is not None:
+                    print(
+                        f"Caching handcrafted features "
+                        f"{cache_index + 1}/{len(self.samples)}: "
+                        f"{image_path.name}"
+                    )
+                    self.cached_handcrafted.append(
+                        _precompute_handcrafted_features(
+                            image_tensor,
+                            feature_extractor,
+                            self.cache_feature_tile_size,
+                        )
+                    )
+            del feature_extractor
 
     def __len__(self) -> int:
         return len(self.samples) * self.patches_per_image
 
     def _select_center(
-        self, mask: np.ndarray, patch_number: int
+        self, mask: np.ndarray, patch_number: int, sample_index: int
     ) -> tuple[int, int]:
         height, width = mask.shape
         if not self.augment:
@@ -270,16 +417,27 @@ class SegmentationDataset(Dataset):
 
         choice = random.random()
         if choice < self.boundary_focus_probability:
-            boundary_y, boundary_x = np.nonzero(
-                bone_fibro_boundary(mask, width=1)
-            )
-            if boundary_y.size:
-                selected = random.randrange(boundary_y.size)
+            if self.cached_boundary_coordinates is not None:
+                coordinates = self.cached_boundary_coordinates[sample_index]
+                boundary_size = len(coordinates)
+            else:
+                boundary_y, boundary_x = np.nonzero(
+                    bone_fibro_boundary(mask, width=1)
+                )
+                coordinates = None
+                boundary_size = boundary_y.size
+            if boundary_size:
+                selected = random.randrange(boundary_size)
+                if coordinates is not None:
+                    selected_y, selected_x = coordinates[selected]
+                else:
+                    selected_y = boundary_y[selected]
+                    selected_x = boundary_x[selected]
                 jitter = self.crop_size // 4
-                center_y = int(boundary_y[selected]) + random.randint(
+                center_y = int(selected_y) + random.randint(
                     -jitter, jitter
                 )
-                center_x = int(boundary_x[selected]) + random.randint(
+                center_x = int(selected_x) + random.randint(
                     -jitter, jitter
                 )
                 return (
@@ -290,11 +448,22 @@ class SegmentationDataset(Dataset):
         if choice < (
             self.boundary_focus_probability + self.class_focus_probability
         ):
-            present = np.unique(mask)
+            present = (
+                self.cached_present_classes[sample_index]
+                if self.cached_present_classes is not None
+                else np.unique(mask)
+            )
             foreground = present[present != BACKGROUND_ID]
             selected_class = int(
                 random.choice(foreground.tolist() or present.tolist())
             )
+            # Rejection sampling avoids retaining coordinate arrays that can
+            # consume several times more CPU RAM than the uint8 masks.
+            for _ in range(128):
+                candidate_y = random.randrange(height)
+                candidate_x = random.randrange(width)
+                if mask[candidate_y, candidate_x] == selected_class:
+                    return candidate_y, candidate_x
             class_y, class_x = np.nonzero(mask == selected_class)
             if class_y.size:
                 selected = random.randrange(class_y.size)
@@ -308,6 +477,13 @@ class SegmentationDataset(Dataset):
         if self.cached_images is not None:
             image = self.cached_images[sample_index]
             mask = self.cached_masks[sample_index]
+            context_pyramid = self.cached_context_images[sample_index]
+            full_boundary = self.cached_boundaries[sample_index]
+            full_handcrafted = (
+                self.cached_handcrafted[sample_index]
+                if self.cached_handcrafted is not None
+                else None
+            )
         else:
             with Image.open(image_path) as image_file:
                 image_np = np.array(
@@ -328,20 +504,29 @@ class SegmentationDataset(Dataset):
                     dtype=np.uint8,
                     copy=True,
                 )
-        if mask.ndim != 2:
-            raise ValueError(
-                f"{mask_path} must be a single-channel or indexed PNG, "
-                f"received shape {mask.shape}"
-            )
-        if tuple(image.shape[-2:]) != tuple(mask.shape):
-            raise ValueError(
-                f"Image and mask dimensions differ for {image_path.name}: "
-                f"{tuple(image.shape[-2:])} versus {mask.shape}"
-            )
-        if mask.min() < 0 or mask.max() > 5:
-            raise ValueError(f"{mask_path} contains class IDs outside 0..5")
+            context_pyramid = None
+            full_boundary = None
+            full_handcrafted = None
+        if self.cached_images is None:
+            if mask.ndim != 2:
+                raise ValueError(
+                    f"{mask_path} must be a single-channel or indexed PNG, "
+                    f"received shape {mask.shape}"
+                )
+            if tuple(image.shape[-2:]) != tuple(mask.shape):
+                raise ValueError(
+                    f"Image and mask dimensions differ for "
+                    f"{image_path.name}: {tuple(image.shape[-2:])} versus "
+                    f"{mask.shape}"
+                )
+            if mask.max() > 5:
+                raise ValueError(
+                    f"{mask_path} contains class IDs outside 0..5"
+                )
 
-        center_y, center_x = self._select_center(mask, patch_number)
+        center_y, center_x = self._select_center(
+            mask, patch_number, sample_index
+        )
         local = _extract_centered_tensor(
             image,
             center_y,
@@ -357,33 +542,84 @@ class SegmentationDataset(Dataset):
             constant_value=BACKGROUND_ID,
         )
 
-        context_native = _extract_centered_tensor(
-            image,
-            center_y,
-            center_x,
-            self.crop_size * self.context_scale,
-        )
+        if context_pyramid is not None:
+            image_height, image_width = image.shape[-2:]
+            pyramid_height, pyramid_width = context_pyramid.shape[-2:]
+            context_center_y = round(
+                center_y * pyramid_height / image_height
+            )
+            context_center_x = round(
+                center_x * pyramid_width / image_width
+            )
+            context = _extract_centered_tensor(
+                context_pyramid,
+                context_center_y,
+                context_center_x,
+                self.crop_size,
+            )
+        else:
+            context_native = _extract_centered_tensor(
+                image,
+                center_y,
+                center_x,
+                self.crop_size * self.context_scale,
+            )
+            context = TF.resize(
+                context_native,
+                [self.crop_size, self.crop_size],
+                interpolation=InterpolationMode.BICUBIC,
+                antialias=True,
+            )
 
-        context = TF.resize(
-            context_native,
-            [self.crop_size, self.crop_size],
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
+        handcrafted = (
+            _extract_centered_tensor(
+                full_handcrafted,
+                center_y,
+                center_x,
+                self.crop_size,
+            )
+            if full_handcrafted is not None
+            else None
+        )
+        boundary = (
+            _extract_centered(
+                full_boundary,
+                center_y,
+                center_x,
+                self.crop_size,
+                constant_value=0,
+            ).astype(np.float32)
+            if full_boundary is not None
+            else None
         )
 
         if self.augment:
             if random.random() < 0.5:
                 local = torch.flip(local, dims=[2])
                 context = torch.flip(context, dims=[2])
+                if handcrafted is not None:
+                    handcrafted = torch.flip(handcrafted, dims=[2])
                 local_mask = local_mask[:, ::-1].copy()
+                if boundary is not None:
+                    boundary = boundary[:, ::-1].copy()
             if random.random() < 0.5:
                 local = torch.flip(local, dims=[1])
                 context = torch.flip(context, dims=[1])
+                if handcrafted is not None:
+                    handcrafted = torch.flip(handcrafted, dims=[1])
                 local_mask = local_mask[::-1, :].copy()
+                if boundary is not None:
+                    boundary = boundary[::-1, :].copy()
             rotation = random.randrange(4)
             local = torch.rot90(local, rotation, dims=(1, 2))
             context = torch.rot90(context, rotation, dims=(1, 2))
+            if handcrafted is not None:
+                handcrafted = torch.rot90(
+                    handcrafted, rotation, dims=(1, 2)
+                )
             local_mask = np.rot90(local_mask, rotation).copy()
+            if boundary is not None:
+                boundary = np.rot90(boundary, rotation).copy()
 
             brightness = random.uniform(0.85, 1.15)
             contrast = random.uniform(0.85, 1.15)
@@ -408,20 +644,32 @@ class SegmentationDataset(Dataset):
             local = local.float().div(255.0)
             context = context.float().div(255.0)
 
-        boundary = bone_fibro_boundary(
-            local_mask,
-            width=3,
-        ).astype(np.float32)
+        if boundary is None:
+            boundary = bone_fibro_boundary(
+                local_mask,
+                width=3,
+            ).astype(np.float32)
 
         muscle_presence = np.float32(
             np.any(local_mask == 3)
         )
 
-        return {
-            "local": local.contiguous(),
-            "context": context.contiguous(),
-            "mask": torch.from_numpy(local_mask).long(),
-            "boundary": torch.from_numpy(boundary),
-            "muscle_presence": torch.tensor(muscle_presence),
+        mask_tensor = torch.from_numpy(local_mask).long()
+        boundary_tensor = torch.from_numpy(boundary)
+        presence_tensor = torch.tensor(muscle_presence)
+        if self.cache_device is not None:
+            mask_tensor = mask_tensor.to(self.cache_device)
+            boundary_tensor = boundary_tensor.to(self.cache_device)
+            presence_tensor = presence_tensor.to(self.cache_device)
+
+        sample = {
+            "local": local,
+            "context": context,
+            "mask": mask_tensor,
+            "boundary": boundary_tensor,
+            "muscle_presence": presence_tensor,
             "name": image_path.stem,
         }
+        if handcrafted is not None:
+            sample["handcrafted"] = handcrafted
+        return sample

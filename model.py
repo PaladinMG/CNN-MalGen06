@@ -79,6 +79,28 @@ class HandcraftedFeatures(nn.Module):
                 dtype=torch.float32,
             ).view(1, 9, 1, 1),
         )
+        # These non-persistent fused banks preserve checkpoint compatibility
+        # while reducing eleven small fixed convolutions to two grouped calls.
+        self.register_buffer(
+            "derivative_kernels",
+            torch.cat(
+                [
+                    self.sobel_x,
+                    self.sobel_y,
+                    self.laplace,
+                    self.dxx,
+                    self.dyy,
+                    self.dxy,
+                ],
+                dim=0,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "gaussian_kernels",
+            self.gaussian.repeat(5, 1, 1, 1),
+            persistent=False,
+        )
 
     @staticmethod
     def _conv(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
@@ -93,20 +115,33 @@ class HandcraftedFeatures(nn.Module):
             + 0.7152 * rgb[:, 1:2]
             + 0.0722 * rgb[:, 2:3]
         )
-        gx = self._conv(gray, self.sobel_x)
-        gy = self._conv(gray, self.sobel_y)
-        laplace = self._conv(gray, self.laplace)
+        derivatives = F.conv2d(
+            F.pad(gray, (1, 1, 1, 1), mode="replicate"),
+            self.derivative_kernels,
+        )
+        gx, gy, laplace, hxx, hyy, hxy = derivatives.split(1, dim=1)
         gradient_magnitude = torch.sqrt(gx.square() + gy.square() + self.eps)
 
-        local_mean = self._conv(gray, self.gaussian)
-        local_mean_sq = self._conv(gray.square(), self.gaussian)
+        moments = torch.cat(
+            [
+                gray,
+                gray.square(),
+                gx.square(),
+                gy.square(),
+                gx * gy,
+            ],
+            dim=1,
+        )
+        smoothed = F.conv2d(
+            F.pad(moments, (1, 1, 1, 1), mode="replicate"),
+            self.gaussian_kernels,
+            groups=5,
+        )
+        local_mean, local_mean_sq, jxx, jyy, jxy = smoothed.split(1, dim=1)
         weighted_deviation = torch.sqrt(
             torch.clamp(local_mean_sq - local_mean.square(), min=0) + self.eps
         )
 
-        jxx = self._conv(gx.square(), self.gaussian)
-        jyy = self._conv(gy.square(), self.gaussian)
-        jxy = self._conv(gx * gy, self.gaussian)
         j_trace = jxx + jyy
         j_root = torch.sqrt((jxx - jyy).square() + 4 * jxy.square() + self.eps)
         structure_max = 0.5 * (j_trace + j_root)
@@ -115,9 +150,6 @@ class HandcraftedFeatures(nn.Module):
             structure_max + structure_min + self.eps
         )
 
-        hxx = self._conv(gray, self.dxx)
-        hyy = self._conv(gray, self.dyy)
-        hxy = self._conv(gray, self.dxy)
         hessian_det = hxx * hyy - hxy.square()
         h_trace = hxx + hyy
         h_root = torch.sqrt((hxx - hyy).square() + 4 * hxy.square() + self.eps)
@@ -309,7 +341,10 @@ class AccurateTissueNet(nn.Module):
         )
 
     def forward(
-        self, local_rgb: torch.Tensor, context_rgb: torch.Tensor
+        self,
+        local_rgb: torch.Tensor,
+        context_rgb: torch.Tensor,
+        handcrafted_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if local_rgb.shape != context_rgb.shape:
             raise ValueError(
@@ -319,7 +354,18 @@ class AccurateTissueNet(nn.Module):
 
         local_normalized = self._normalize_rgb(local_rgb)
         rgb_stem = self.rgb_relu(self.rgb_bn1(self.rgb_conv1(local_normalized)))
-        feature_stem = self.feature_stem(self.handcrafted(local_rgb))
+        if handcrafted_features is None:
+            handcrafted_features = self.handcrafted(local_rgb)
+        elif (
+            handcrafted_features.ndim != 4
+            or handcrafted_features.shape[1] != 9
+            or handcrafted_features.shape[-2:] != local_rgb.shape[-2:]
+        ):
+            raise ValueError(
+                "handcrafted_features must have shape [N, 9, H, W] matching "
+                f"local_rgb; received {tuple(handcrafted_features.shape)}"
+            )
+        feature_stem = self.feature_stem(handcrafted_features)
         stem = self.stem_fusion(torch.cat([rgb_stem, feature_stem], dim=1))
 
         local1 = self.local_layer1(self.local_maxpool(stem))

@@ -19,6 +19,10 @@ EPOCHS="${EPOCHS:-80}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 CROP_SIZE="${CROP_SIZE:-512}"
 WORKERS="${WORKERS:-4}"
+CACHE_TRAINING_IMAGES="${CACHE_TRAINING_IMAGES:-0}"
+CACHE_HANDCRAFTED_FEATURES="${CACHE_HANDCRAFTED_FEATURES:-0}"
+CACHE_VRAM_RESERVE_GB="${CACHE_VRAM_RESERVE_GB:-10}"
+CACHE_FEATURE_TILE_SIZE="${CACHE_FEATURE_TILE_SIZE:-1024}"
 
 if [[ -n "${MODULES:-}" ]]; then
     module load ${MODULES}
@@ -44,6 +48,20 @@ if [[ -n "${VAL_DATA:-}" ]]; then
 fi
 if [[ -n "${RESUME:-}" ]]; then
     ARGS+=(--resume "${RESUME}")
+fi
+if [[ "${CACHE_TRAINING_IMAGES}" == "1" ]]; then
+    ARGS+=(
+        --cache-training-images
+        --cache-vram-reserve-gb "${CACHE_VRAM_RESERVE_GB}"
+        --cache-feature-tile-size "${CACHE_FEATURE_TILE_SIZE}"
+    )
+fi
+if [[ "${CACHE_HANDCRAFTED_FEATURES}" == "1" ]]; then
+    if [[ "${CACHE_TRAINING_IMAGES}" != "1" ]]; then
+        echo "CACHE_HANDCRAFTED_FEATURES=1 requires CACHE_TRAINING_IMAGES=1" >&2
+        exit 2
+    fi
+    ARGS+=(--cache-handcrafted-features)
 fi
 if [[ -n "${EXTRA_ARGS:-}" ]]; then
     read -r -a USER_ARGS <<< "${EXTRA_ARGS}"

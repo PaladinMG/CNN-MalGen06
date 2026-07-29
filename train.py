@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from data import (
     SegmentationDataset,
     discover_samples,
-    estimate_rgb_cache_bytes,
+    estimate_training_cache_bytes,
 )
 from model import AccurateTissueNet, CLASS_NAMES
 
@@ -35,13 +35,21 @@ def multiclass_dice_loss(
     class_weights: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    one_hot = F.one_hot(target, num_classes=len(CLASS_NAMES)).permute(0, 3, 1, 2)
-    one_hot = one_hot.to(probabilities.dtype)
+    classes = len(CLASS_NAMES)
     dimensions = (0, 2, 3)
-    intersection = (probabilities * one_hot).sum(dim=dimensions)
-    denominator = probabilities.sum(dim=dimensions) + one_hot.sum(
-        dim=dimensions
-    )
+    target_flat = target.reshape(-1)
+    target_probabilities = probabilities.gather(
+        1, target[:, None]
+    ).reshape(-1)
+    intersection = torch.zeros(
+        classes,
+        dtype=probabilities.dtype,
+        device=probabilities.device,
+    ).scatter_add_(0, target_flat, target_probabilities)
+    target_count = torch.bincount(
+        target_flat, minlength=classes
+    ).to(probabilities.dtype)
+    denominator = probabilities.sum(dim=dimensions) + target_count
     loss_per_class = 1 - (2 * intersection + eps) / (denominator + eps)
     if class_weights is None:
         return loss_per_class.mean()
@@ -142,12 +150,14 @@ def complete_loss(
 
 
 class Metrics:
-    def __init__(self, classes: int = 6) -> None:
+    def __init__(self, device: torch.device, classes: int = 6) -> None:
         self.classes = classes
-        self.confusion = torch.zeros(classes, classes, dtype=torch.float64)
-        self.boundary_tp = 0
-        self.boundary_fp = 0
-        self.boundary_fn = 0
+        self.confusion = torch.zeros(
+            classes, classes, dtype=torch.int64, device=device
+        )
+        self.boundary_counts = torch.zeros(
+            3, dtype=torch.int64, device=device
+        )
 
     def update(
         self,
@@ -161,35 +171,82 @@ class Metrics:
         matrix = torch.bincount(
             flat, minlength=self.classes * self.classes
         ).reshape(self.classes, self.classes)
-        self.confusion += matrix.detach().cpu()
+        self.confusion += matrix.detach()
 
         predicted_boundary = boundary_probability[:, 0] >= 0.5
         true_boundary = boundary_target >= 0.5
-        self.boundary_tp += int((predicted_boundary & true_boundary).sum())
-        self.boundary_fp += int((predicted_boundary & ~true_boundary).sum())
-        self.boundary_fn += int((~predicted_boundary & true_boundary).sum())
+        self.boundary_counts += torch.stack(
+            [
+                (predicted_boundary & true_boundary).sum(),
+                (predicted_boundary & ~true_boundary).sum(),
+                (~predicted_boundary & true_boundary).sum(),
+            ]
+        )
 
     def results(self) -> tuple[float, list[float], float]:
-        intersection = self.confusion.diag()
+        confusion = self.confusion.double()
+        intersection = confusion.diag()
         union = (
-            self.confusion.sum(0)
-            + self.confusion.sum(1)
+            confusion.sum(0)
+            + confusion.sum(1)
             - intersection
         )
         valid = union > 0
         per_class = torch.full_like(intersection, float("nan"))
         per_class[valid] = intersection[valid] / union[valid]
         mean_iou = float(per_class[valid].mean()) if torch.any(valid) else 0.0
-        boundary_f1 = (
-            2 * self.boundary_tp
-            / max(
-                1,
-                2 * self.boundary_tp
-                + self.boundary_fp
-                + self.boundary_fn,
-            )
+        boundary_tp, boundary_fp, boundary_fn = self.boundary_counts.double()
+        boundary_f1 = 2 * boundary_tp / (
+            2 * boundary_tp + boundary_fp + boundary_fn
+        ).clamp_min(1)
+        return (
+            float(mean_iou),
+            per_class.detach().cpu().tolist(),
+            float(boundary_f1),
         )
-        return mean_iou, per_class.tolist(), boundary_f1
+
+
+def device_channels_last_collate(
+    samples: list[dict[str, torch.Tensor | str]],
+) -> dict[str, torch.Tensor | list[str]]:
+    """Collate cached CUDA samples directly into channels-last batches."""
+    batch_size = len(samples)
+    first_local = samples[0]["local"]
+    assert isinstance(first_local, torch.Tensor)
+    _, height, width = first_local.shape
+
+    def image_batch(key: str, channels: int) -> torch.Tensor:
+        first = samples[0][key]
+        assert isinstance(first, torch.Tensor)
+        output = torch.empty(
+            (batch_size, channels, height, width),
+            dtype=first.dtype,
+            device=first.device,
+            memory_format=torch.channels_last,
+        )
+        for index, sample in enumerate(samples):
+            value = sample[key]
+            assert isinstance(value, torch.Tensor)
+            output[index].copy_(value)
+        return output
+
+    result: dict[str, torch.Tensor | list[str]] = {
+        "local": image_batch("local", 3),
+        "context": image_batch("context", 3),
+        "mask": torch.stack(
+            [sample["mask"] for sample in samples]  # type: ignore[list-item]
+        ),
+        "boundary": torch.stack(
+            [sample["boundary"] for sample in samples]  # type: ignore[list-item]
+        ),
+        "muscle_presence": torch.stack(
+            [sample["muscle_presence"] for sample in samples]  # type: ignore[list-item]
+        ),
+        "name": [str(sample["name"]) for sample in samples],
+    }
+    if "handcrafted" in samples[0]:
+        result["handcrafted"] = image_batch("handcrafted", 9)
+    return result
 
 
 def make_loader(
@@ -208,6 +265,9 @@ def make_loader(
         "pin_memory": use_cuda and not already_on_device,
         "persistent_workers": workers > 0,
         "drop_last": training and len(dataset) >= batch_size,
+        "collate_fn": (
+            device_channels_last_collate if already_on_device else None
+        ),
     }
 
     if workers > 0:
@@ -229,8 +289,8 @@ def run_epoch(
 ) -> tuple[float, float, list[float], float, dict[str, float]]:
     training = optimizer is not None
     model.train(training)
-    metrics = Metrics()
-    total_loss = 0.0
+    metrics = Metrics(device)
+    total_loss = torch.zeros((), device=device)
     components: dict[str, float] = defaultdict(float)
     if training:
         optimizer.zero_grad(set_to_none=True)
@@ -244,6 +304,17 @@ def run_epoch(
         mask = batch["mask"].to(device, non_blocking=True)
         boundary = batch["boundary"].to(device, non_blocking=True)
         presence = batch["muscle_presence"].to(device, non_blocking=True)
+        handcrafted = batch.get("handcrafted")
+        if handcrafted is not None:
+            handcrafted = handcrafted.to(device, non_blocking=True)
+            if not amp and handcrafted.dtype != local.dtype:
+                # Cached maps use FP16 storage. Without CUDA autocast, the
+                # first convolution requires their dtype to match the model.
+                handcrafted = handcrafted.to(dtype=local.dtype)
+            if device.type == "cuda":
+                handcrafted = handcrafted.contiguous(
+                    memory_format=torch.channels_last
+                )
 
         with torch.set_grad_enabled(training):
             with torch.autocast(
@@ -251,7 +322,7 @@ def run_epoch(
                 dtype=torch.float16,
                 enabled=amp,
             ):
-                outputs = model(local, context)
+                outputs = model(local, context, handcrafted)
                 loss, batch_components, probabilities = complete_loss(
                     model,
                     outputs,
@@ -289,11 +360,14 @@ def run_epoch(
     batches = len(loader)
     mean_iou, per_class, boundary_f1 = metrics.results()
     return (
-        total_loss / batches,
+        float((total_loss / batches).detach().cpu()),
         mean_iou,
         per_class,
         boundary_f1,
-        {name: value / batches for name, value in components.items()},
+        {
+            name: float((value / batches).detach().cpu())
+            for name, value in components.items()
+        },
     )
 
 
@@ -318,6 +392,20 @@ def parse_args() -> argparse.Namespace:
         "--cache-training-images",
         action="store_true",
         help="Decode training images once and cache uint8 images in CUDA VRAM.",
+    )
+    parser.add_argument(
+        "--cache-handcrafted-features",
+        action="store_true",
+        help=(
+            "Precompute the nine structural maps once in FP16 VRAM. Requires "
+            "--cache-training-images and about 18 extra bytes/source pixel."
+        ),
+    )
+    parser.add_argument(
+        "--cache-feature-tile-size",
+        type=int,
+        default=1024,
+        help="Tile size used to bound temporary VRAM during feature precomputation.",
     )
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -352,6 +440,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--boundary-focus + --class-focus cannot exceed 1")
     if args.cache_vram_reserve_gb < 0:
         parser.error("--cache-vram-reserve-gb cannot be negative")
+    if args.cache_handcrafted_features and not args.cache_training_images:
+        parser.error(
+            "--cache-handcrafted-features requires --cache-training-images"
+        )
+    if args.cache_feature_tile_size < 64:
+        parser.error("--cache-feature-tile-size must be at least 64")
     return args
 
 
@@ -426,7 +520,12 @@ def main() -> None:
             else all_samples
         )
 
-        cache_bytes = estimate_rgb_cache_bytes(training_samples)
+        cache_sizes = estimate_training_cache_bytes(
+            training_samples,
+            runtime_context_scale,
+            args.cache_handcrafted_features,
+        )
+        cache_bytes = cache_sizes["total"]
 
         free_bytes, total_bytes = torch.cuda.mem_get_info(device)
 
@@ -440,8 +539,11 @@ def main() -> None:
         )
 
         print(
-            f"Training RGB cache: "
-            f"{cache_bytes / 1024 ** 3:.2f} GiB"
+            "Training CUDA cache: "
+            f"RGB={cache_sizes['rgb'] / 1024 ** 3:.2f} GiB, "
+            f"context pyramid={cache_sizes['context'] / 1024 ** 3:.2f} GiB, "
+            f"features={cache_sizes['features'] / 1024 ** 3:.2f} GiB, "
+            f"total={cache_bytes / 1024 ** 3:.2f} GiB"
         )
 
         print(
@@ -455,6 +557,12 @@ def main() -> None:
             f"{args.cache_vram_reserve_gb:.2f} GiB "
             f"for training"
         )
+        if args.cache_handcrafted_features:
+            print(
+                "Note: cached structural maps receive geometric augmentation "
+                "but remain invariant to RGB color jitter. Compare validation "
+                "area error against an uncached-feature run."
+            )
 
         if cache_bytes > usable_bytes:
             raise RuntimeError(
@@ -479,6 +587,8 @@ def main() -> None:
             if args.cache_training_images and device.type == "cuda"
             else None
         ),
+        cache_handcrafted_features=args.cache_handcrafted_features,
+        cache_feature_tile_size=args.cache_feature_tile_size,
     )
     val_dataset = SegmentationDataset(
         validation_root,
