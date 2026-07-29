@@ -11,11 +11,17 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from data import SegmentationDataset, discover_samples
+from data import (
+    SegmentationDataset,
+    discover_samples,
+    estimate_rgb_cache_bytes,
+)
 from model import AccurateTissueNet, CLASS_NAMES
 
 
 COARSE_MAPPING = (0, 1, 2, 1, 3, 4)
+
+
 
 
 def coarse_targets(mask: torch.Tensor) -> torch.Tensor:
@@ -126,11 +132,11 @@ def complete_loss(
         + 0.05 * presence
     )
     components = {
-        "coarse": coarse.detach().item(),
-        "muscle": muscle.detach().item(),
-        "dice": dice.detach().item(),
-        "boundary": boundary_component.detach().item(),
-        "presence": presence.detach().item(),
+        "coarse": coarse.detach(),
+        "muscle": muscle.detach(),
+        "dice": dice.detach(),
+        "boundary": boundary_component.detach(),
+        "presence": presence.detach(),
     }
     return total, components, probabilities
 
@@ -192,18 +198,21 @@ def make_loader(
     workers: int,
     training: bool,
     use_cuda: bool,
+    already_on_device: bool = False,
 ) -> DataLoader:
     options = {
         "dataset": dataset,
         "batch_size": batch_size,
         "shuffle": training,
         "num_workers": workers,
-        "pin_memory": use_cuda,
+        "pin_memory": use_cuda and not already_on_device,
         "persistent_workers": workers > 0,
         "drop_last": training and len(dataset) >= batch_size,
     }
+
     if workers > 0:
         options["prefetch_factor"] = 2
+
     return DataLoader(**options)
 
 
@@ -267,7 +276,7 @@ def run_epoch(
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.detach().item()
+        total_loss += loss.detach()
         for name, value in batch_components.items():
             components[name] += value
         metrics.update(
@@ -295,6 +304,20 @@ def parse_args() -> argparse.Namespace:
         "--val-data",
         type=Path,
         help="Separate specimen-level validation dataset. Recommended.",
+    )
+    parser.add_argument(
+        "--cache-vram-reserve-gb",
+        type=float,
+        default=7.0,
+        help=(
+            "VRAM to leave unused by the image cache for the "
+            "model, activations, gradients, and temporary allocations."
+        ),
+    )
+    parser.add_argument(
+        "--cache-training-images",
+        action="store_true",
+        help="Decode training images once and cache uint8 images in CUDA VRAM.",
     )
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -327,6 +350,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("Batch and accumulation sizes must be positive")
     if args.boundary_focus + args.class_focus > 1:
         parser.error("--boundary-focus + --class-focus cannot exceed 1")
+    if args.cache_vram_reserve_gb < 0:
+        parser.error("--cache-vram-reserve-gb cannot be negative")
     return args
 
 
@@ -367,6 +392,8 @@ def main() -> None:
                 "context_scale", args.context_scale
             )
         )
+    train_indices: list[int] | None
+    val_indices: list[int] | None
 
     if args.val_data:
         train_indices = None
@@ -374,10 +401,14 @@ def main() -> None:
         validation_root = args.val_data
     else:
         sample_count = len(discover_samples(args.data))
-        order = torch.randperm(
-            sample_count, generator=torch.Generator().manual_seed(args.seed)
+
+        order: list[int] = torch.randperm(
+            sample_count,
+            generator=torch.Generator().manual_seed(args.seed),
         ).tolist()
+
         validation_count = max(1, round(0.15 * sample_count))
+
         val_indices = order[:validation_count]
         train_indices = order[validation_count:]
         validation_root = args.data
@@ -385,6 +416,54 @@ def main() -> None:
             "Warning: using an automatic image-level 85/15 split. For final "
             "measurements, pass --val-data split by patient/specimen."
         )
+
+    if args.cache_training_images and device.type == "cuda":
+        all_samples = discover_samples(args.data)
+
+        training_samples: list[tuple[Path, Path]] = (
+            [all_samples[index] for index in train_indices]
+            if train_indices is not None
+            else all_samples
+        )
+
+        cache_bytes = estimate_rgb_cache_bytes(training_samples)
+
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+
+        reserve_bytes = int(
+            args.cache_vram_reserve_gb * 1024 ** 3
+        )
+
+        usable_bytes = max(
+            0,
+            free_bytes - reserve_bytes,
+        )
+
+        print(
+            f"Training RGB cache: "
+            f"{cache_bytes / 1024 ** 3:.2f} GiB"
+        )
+
+        print(
+            f"CUDA memory: "
+            f"{free_bytes / 1024 ** 3:.2f} GiB free / "
+            f"{total_bytes / 1024 ** 3:.2f} GiB total"
+        )
+
+        print(
+            f"Reserving "
+            f"{args.cache_vram_reserve_gb:.2f} GiB "
+            f"for training"
+        )
+
+        if cache_bytes > usable_bytes:
+            raise RuntimeError(
+                "Training image cache is too large for the "
+                "configured VRAM reserve. "
+                f"Cache requires {cache_bytes / 1024 ** 3:.2f} GiB, "
+                f"but only {usable_bytes / 1024 ** 3:.2f} GiB "
+                "is available for caching."
+            )
 
     train_dataset = SegmentationDataset(
         args.data,
@@ -395,6 +474,11 @@ def main() -> None:
         class_focus_probability=args.class_focus,
         patches_per_image=args.train_patches_per_image,
         sample_indices=train_indices,
+        cache_device=(
+            device
+            if args.cache_training_images and device.type == "cuda"
+            else None
+        ),
     )
     val_dataset = SegmentationDataset(
         validation_root,
@@ -406,8 +490,21 @@ def main() -> None:
         patches_per_image=args.val_patches_per_image,
         sample_indices=val_indices,
     )
+    train_workers = (
+        0
+        if args.cache_training_images and device.type == "cuda"
+        else args.workers
+    )
     train_loader = make_loader(
-        train_dataset, args.batch_size, args.workers, True, device.type == "cuda"
+        train_dataset,
+        args.batch_size,
+        train_workers,
+        True,
+        device.type == "cuda",
+        already_on_device=(
+            args.cache_training_images
+            and device.type == "cuda"
+        ),
     )
     val_loader = make_loader(
         val_dataset, args.batch_size, args.workers, False, device.type == "cuda"

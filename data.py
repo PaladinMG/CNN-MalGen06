@@ -9,6 +9,12 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from torchvision.transforms.v2 import functional as TF
+from torchvision.transforms import InterpolationMode
+
+import torch.nn.functional as F
+
+from collections.abc import Sequence
 
 Image.MAX_IMAGE_PIXELS = None
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
@@ -87,27 +93,95 @@ def _extract_centered(
             )
     return np.ascontiguousarray(crop)
 
+def _extract_centered_tensor(
+    tensor: torch.Tensor,
+    center_y: int,
+    center_x: int,
+    size: int,
+) -> torch.Tensor:
+    _, height, width = tensor.shape
 
-def _color_jitter(
-    image: np.ndarray,
+    top = center_y - size // 2
+    left = center_x - size // 2
+    bottom = top + size
+    right = left + size
+
+    pad_top = max(0, -top)
+    pad_left = max(0, -left)
+    pad_bottom = max(0, bottom - height)
+    pad_right = max(0, right - width)
+
+    top = max(0, top)
+    left = max(0, left)
+    bottom = min(height, bottom)
+    right = min(width, right)
+
+    crop = tensor[:, top:bottom, left:right]
+
+    if pad_top or pad_bottom or pad_left or pad_right:
+        crop = F.pad(
+            crop,
+            (
+                pad_left,
+                pad_right,
+                pad_top,
+                pad_bottom,
+            ),
+            mode="replicate",
+        )
+
+    return crop.contiguous()
+
+def _color_jitter_tensor(
+    image: torch.Tensor,
     brightness: float,
     contrast: float,
     saturation: float,
     gamma: float,
-) -> np.ndarray:
-    image = image.astype(np.float32) / 255.0
-    image *= brightness
-    channel_mean = image.mean(axis=(0, 1), keepdims=True)
-    image = (image - channel_mean) * contrast + channel_mean
-    gray = (
-        0.2126 * image[..., 0:1]
-        + 0.7152 * image[..., 1:2]
-        + 0.0722 * image[..., 2:3]
-    )
-    image = gray + saturation * (image - gray)
-    image = np.power(np.clip(image, 0, 1), gamma)
-    return np.clip(image, 0, 1)
+) -> torch.Tensor:
 
+    image = image.float().div(255.0)
+
+    image = image * brightness
+
+    channel_mean = image.mean(
+        dim=(1, 2),
+        keepdim=True,
+    )
+
+    image = (
+        (image - channel_mean) * contrast
+        + channel_mean
+    )
+
+    gray = (
+        0.2126 * image[0:1]
+        + 0.7152 * image[1:2]
+        + 0.0722 * image[2:3]
+    )
+
+    image = gray + saturation * (image - gray)
+
+    image = (
+        image.clamp(0, 1)
+        .pow(gamma)
+        .clamp(0, 1)
+    )
+
+    return image
+
+def estimate_rgb_cache_bytes(
+    samples: Sequence[tuple[Path, Path]],
+) -> int:
+    total = 0
+
+    for image_path, _ in samples:
+        with Image.open(image_path) as image:
+            width, height = image.size
+
+        total += width * height * 3
+
+    return total
 
 class SegmentationDataset(Dataset):
     """
@@ -125,6 +199,7 @@ class SegmentationDataset(Dataset):
         class_focus_probability: float = 0.35,
         patches_per_image: int = 2,
         sample_indices: list[int] | None = None,
+        cache_device: torch.device | None = None,
     ) -> None:
         if crop_size <= 0 or crop_size % 32:
             raise ValueError("crop_size must be a positive multiple of 32")
@@ -137,12 +212,47 @@ class SegmentationDataset(Dataset):
         self.boundary_focus_probability = boundary_focus_probability
         self.class_focus_probability = class_focus_probability
         self.patches_per_image = max(1, patches_per_image)
+        self.cache_device = cache_device
         all_samples = discover_samples(root)
         self.samples = (
             [all_samples[index] for index in sample_indices]
             if sample_indices is not None
             else all_samples
         )
+
+        self.cached_images = None
+        self.cached_masks = None
+
+        if self.cache_device is not None:
+            self.cached_images = []
+            self.cached_masks = []
+
+            for image_path, mask_path in self.samples:
+                with Image.open(image_path) as image_file:
+                    image = np.array(
+                        image_file.convert("RGB"),
+                        dtype=np.uint8,
+                        copy=True,
+                    )
+
+                with Image.open(mask_path) as mask_file:
+                    mask = np.array(
+                        mask_file,
+                        dtype=np.uint8,
+                        copy=True,
+                    )
+
+                image_tensor = (
+                    torch.from_numpy(image)
+                    .permute(2, 0, 1)
+                    .contiguous()
+                    .to(self.cache_device)
+                )
+
+                self.cached_images.append(image_tensor)
+
+                # Keep mask in CPU RAM initially.
+                self.cached_masks.append(mask)
 
     def __len__(self) -> int:
         return len(self.samples) * self.patches_per_image
@@ -195,29 +305,50 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
         sample_index, patch_number = divmod(index, self.patches_per_image)
         image_path, mask_path = self.samples[sample_index]
-        with Image.open(image_path) as image_file:
-            image = np.array(image_file.convert("RGB"), dtype=np.uint8, copy=True)
-        with Image.open(mask_path) as mask_file:
-            # Preserve indexed-PNG class IDs. Converting a palette mask to
-            # luminance would silently replace indices with palette brightness.
-            mask = np.array(mask_file, dtype=np.int64, copy=True)
+        if self.cached_images is not None:
+            image = self.cached_images[sample_index]
+            mask = self.cached_masks[sample_index]
+        else:
+            with Image.open(image_path) as image_file:
+                image_np = np.array(
+                    image_file.convert("RGB"),
+                    dtype=np.uint8,
+                    copy=True,
+                )
+            image = (
+                torch.from_numpy(image_np)
+                .permute(2, 0, 1)
+                .contiguous()
+            )
+            with Image.open(mask_path) as mask_file:
+                # Preserve indexed-PNG class IDs. Converting a palette mask to
+                # luminance would silently replace indices with palette brightness.
+                mask = np.array(
+                    mask_file,
+                    dtype=np.uint8,
+                    copy=True,
+                )
         if mask.ndim != 2:
             raise ValueError(
                 f"{mask_path} must be a single-channel or indexed PNG, "
                 f"received shape {mask.shape}"
             )
-        if image.shape[:2] != mask.shape:
+        if tuple(image.shape[-2:]) != tuple(mask.shape):
             raise ValueError(
                 f"Image and mask dimensions differ for {image_path.name}: "
-                f"{image.shape[:2]} versus {mask.shape}"
+                f"{tuple(image.shape[-2:])} versus {mask.shape}"
             )
         if mask.min() < 0 or mask.max() > 5:
             raise ValueError(f"{mask_path} contains class IDs outside 0..5")
 
         center_y, center_x = self._select_center(mask, patch_number)
-        local = _extract_centered(
-            image, center_y, center_x, self.crop_size
+        local = _extract_centered_tensor(
+            image,
+            center_y,
+            center_x,
+            self.crop_size,
         )
+
         local_mask = _extract_centered(
             mask,
             center_y,
@@ -225,58 +356,71 @@ class SegmentationDataset(Dataset):
             self.crop_size,
             constant_value=BACKGROUND_ID,
         )
-        context_native = _extract_centered(
+
+        context_native = _extract_centered_tensor(
             image,
             center_y,
             center_x,
             self.crop_size * self.context_scale,
         )
-        context_image = Image.fromarray(context_native)
-        context = np.array(
-            context_image.resize(
-                (self.crop_size, self.crop_size),
-                Image.Resampling.LANCZOS,
-                reducing_gap=2.0,
-            ),
-            dtype=np.uint8,
-            copy=True,
+
+        context = TF.resize(
+            context_native,
+            [self.crop_size, self.crop_size],
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
         )
-        context_image.close()
 
         if self.augment:
             if random.random() < 0.5:
-                local = local[:, ::-1].copy()
-                context = context[:, ::-1].copy()
+                local = torch.flip(local, dims=[2])
+                context = torch.flip(context, dims=[2])
                 local_mask = local_mask[:, ::-1].copy()
             if random.random() < 0.5:
-                local = local[::-1, :].copy()
-                context = context[::-1, :].copy()
+                local = torch.flip(local, dims=[1])
+                context = torch.flip(context, dims=[1])
                 local_mask = local_mask[::-1, :].copy()
             rotation = random.randrange(4)
-            local = np.rot90(local, rotation).copy()
-            context = np.rot90(context, rotation).copy()
+            local = torch.rot90(local, rotation, dims=(1, 2))
+            context = torch.rot90(context, rotation, dims=(1, 2))
             local_mask = np.rot90(local_mask, rotation).copy()
 
             brightness = random.uniform(0.85, 1.15)
             contrast = random.uniform(0.85, 1.15)
             saturation = random.uniform(0.75, 1.25)
             gamma = random.uniform(0.85, 1.15)
-            local = _color_jitter(
-                local, brightness, contrast, saturation, gamma
+            local = _color_jitter_tensor(
+                local,
+                brightness,
+                contrast,
+                saturation,
+                gamma,
             )
-            context = _color_jitter(
-                context, brightness, contrast, saturation, gamma
+
+            context = _color_jitter_tensor(
+                context,
+                brightness,
+                contrast,
+                saturation,
+                gamma,
             )
         else:
-            local = local.astype(np.float32) / 255.0
-            context = context.astype(np.float32) / 255.0
+            local = local.float().div(255.0)
+            context = context.float().div(255.0)
 
-        boundary = bone_fibro_boundary(local_mask, width=3).astype(np.float32)
-        muscle_presence = np.float32(np.any(local_mask == 3))
+        boundary = bone_fibro_boundary(
+            local_mask,
+            width=3,
+        ).astype(np.float32)
+
+        muscle_presence = np.float32(
+            np.any(local_mask == 3)
+        )
+
         return {
-            "local": torch.from_numpy(local).permute(2, 0, 1),
-            "context": torch.from_numpy(context).permute(2, 0, 1),
-            "mask": torch.from_numpy(local_mask),
+            "local": local.contiguous(),
+            "context": context.contiguous(),
+            "mask": torch.from_numpy(local_mask).long(),
             "boundary": torch.from_numpy(boundary),
             "muscle_presence": torch.tensor(muscle_presence),
             "name": image_path.stem,
