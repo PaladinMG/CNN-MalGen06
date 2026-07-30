@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import argparse
 
+import numpy as np
 import torch
 
-from data import _color_jitter_tensor, _precompute_handcrafted_features
+from data import (
+    SegmentationDataset,
+    _color_jitter_tensor,
+    _precompute_handcrafted_features,
+)
 from model import AccurateTissueNet
 from train import (
     batched_color_jitter,
     complete_loss,
+    deterministic_split_indices,
     device_channels_last_collate,
 )
 
@@ -31,6 +37,33 @@ def main() -> None:
     )
     amp = device.type == "cuda"
     torch.manual_seed(7)
+
+    train_patch_ids, val_patch_ids = deterministic_split_indices(
+        item_count=60,
+        validation_fraction=0.15,
+        seed=7,
+    )
+    assert len(train_patch_ids) == 51
+    assert len(val_patch_ids) == 9
+    assert set(train_patch_ids).isdisjoint(val_patch_ids)
+    assert set(train_patch_ids) | set(val_patch_ids) == set(range(60))
+
+    patch_dataset = object.__new__(SegmentationDataset)
+    patch_dataset.patches_per_image = 6
+    patch_dataset.augment = True
+    patch_dataset.fixed_patch_centers = True
+    dummy_mask = np.zeros((120, 180), dtype=np.uint8)
+    training_centers = [
+        patch_dataset._select_center(dummy_mask, patch_id, 0)
+        for patch_id in range(6)
+    ]
+    patch_dataset.augment = False
+    validation_centers = [
+        patch_dataset._select_center(dummy_mask, patch_id, 0)
+        for patch_id in range(6)
+    ]
+    assert training_centers == validation_centers
+    assert len(set(training_centers)) == 6
 
     model = AccurateTissueNet(pretrained=False)
     if device.type == "cuda":
@@ -175,7 +208,8 @@ def main() -> None:
         f"parameters={parameters:,} loss={loss.item():.5f} "
         f"probability_sum_max_error={maximum_sum_error:.3g} "
         f"feature_cache_max_error={feature_cache_max_error:.3g} "
-        f"batched_augmentation_max_error={augmentation_max_error:.3g}"
+        f"batched_augmentation_max_error={augmentation_max_error:.3g} "
+        f"patch_split={len(train_patch_ids)}/{len(val_patch_ids)}"
     )
     print(
         "loss_components "

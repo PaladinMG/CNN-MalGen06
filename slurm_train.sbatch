@@ -25,6 +25,9 @@ CACHE_VRAM_RESERVE_GB="${CACHE_VRAM_RESERVE_GB:-10}"
 CACHE_FEATURE_TILE_SIZE="${CACHE_FEATURE_TILE_SIZE:-1024}"
 COMPILE_MODEL="${COMPILE_MODEL:-0}"
 COMPILE_MODE="${COMPILE_MODE:-reduce-overhead}"
+SPLIT_UNIT="${SPLIT_UNIT:-patch}"
+VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.15}"
+PATCH_POOL_PER_IMAGE="${PATCH_POOL_PER_IMAGE:-}"
 
 if [[ -n "${MODULES:-}" ]]; then
     module load ${MODULES}
@@ -41,6 +44,8 @@ ARGS=(
     --batch-size "${BATCH_SIZE}"
     --crop-size "${CROP_SIZE}"
     --workers "${WORKERS}"
+    --split-unit "${SPLIT_UNIT}"
+    --validation-fraction "${VALIDATION_FRACTION}"
     --output "${OUTPUT}"
     --last-output "${LAST_OUTPUT}"
 )
@@ -50,6 +55,9 @@ if [[ -n "${VAL_DATA:-}" ]]; then
 fi
 if [[ -n "${RESUME:-}" ]]; then
     ARGS+=(--resume "${RESUME}")
+fi
+if [[ -n "${PATCH_POOL_PER_IMAGE}" ]]; then
+    ARGS+=(--patch-pool-per-image "${PATCH_POOL_PER_IMAGE}")
 fi
 if [[ "${CACHE_TRAINING_IMAGES}" == "1" ]]; then
     ARGS+=(

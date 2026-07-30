@@ -11,7 +11,7 @@ import time
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from data import (
     SegmentationDataset,
@@ -22,6 +22,25 @@ from model import AccurateTissueNet, CLASS_NAMES
 
 
 COARSE_MAPPING = (0, 1, 2, 1, 3, 4)
+
+
+def deterministic_split_indices(
+    item_count: int,
+    validation_fraction: float,
+    seed: int,
+) -> tuple[list[int], list[int]]:
+    """Return disjoint training/validation IDs with at least one in each."""
+    if item_count < 2:
+        raise ValueError("A split requires at least two items")
+    order: list[int] = torch.randperm(
+        item_count,
+        generator=torch.Generator().manual_seed(seed),
+    ).tolist()
+    validation_count = min(
+        item_count - 1,
+        max(1, round(validation_fraction * item_count)),
+    )
+    return order[validation_count:], order[:validation_count]
 
 
 
@@ -330,7 +349,7 @@ def batched_color_jitter(
 
 
 def make_loader(
-    dataset: SegmentationDataset,
+    dataset: Dataset,
     batch_size: int,
     workers: int,
     training: bool,
@@ -498,6 +517,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-scale", type=int, default=4)
     parser.add_argument("--train-patches-per-image", type=int, default=2)
     parser.add_argument("--val-patches-per-image", type=int, default=4)
+    parser.add_argument(
+        "--split-unit",
+        choices=("patch", "image"),
+        default="patch",
+        help=(
+            "When --val-data is omitted, split deterministic patches by "
+            "default or retain the previous whole-image split."
+        ),
+    )
+    parser.add_argument(
+        "--validation-fraction",
+        type=float,
+        default=0.15,
+        help="Fraction used for the automatic patch or image validation split.",
+    )
+    parser.add_argument(
+        "--patch-pool-per-image",
+        type=int,
+        help=(
+            "Deterministic candidate patches per source image for a patch "
+            "split. Defaults to train-patches + val-patches."
+        ),
+    )
     parser.add_argument("--boundary-focus", type=float, default=0.45)
     parser.add_argument("--class-focus", type=float, default=0.35)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -544,6 +586,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-scale must be at least 1")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         parser.error("Batch and accumulation sizes must be positive")
+    if not 0 < args.validation_fraction < 1:
+        parser.error("--validation-fraction must be between 0 and 1")
+    if (
+        args.patch_pool_per_image is not None
+        and args.patch_pool_per_image < 2
+    ):
+        parser.error("--patch-pool-per-image must be at least 2")
     if args.boundary_focus + args.class_focus > 1:
         parser.error("--boundary-focus + --class-focus cannot exceed 1")
     if args.cache_vram_reserve_gb < 0:
@@ -605,37 +654,67 @@ def main() -> None:
                 "context_scale", args.context_scale
             )
         )
-    train_indices: list[int] | None
-    val_indices: list[int] | None
+    train_image_indices: list[int] | None
+    val_image_indices: list[int] | None
+    train_patch_indices: list[int] | None = None
+    val_patch_indices: list[int] | None = None
+    patch_pool_per_image: int | None = None
 
     if args.val_data:
-        train_indices = None
-        val_indices = None
+        train_image_indices = None
+        val_image_indices = None
         validation_root = args.val_data
     else:
         sample_count = len(discover_samples(args.data))
-
-        order: list[int] = torch.randperm(
-            sample_count,
-            generator=torch.Generator().manual_seed(args.seed),
-        ).tolist()
-
-        validation_count = max(1, round(0.15 * sample_count))
-
-        val_indices = order[:validation_count]
-        train_indices = order[validation_count:]
         validation_root = args.data
-        print(
-            "Warning: using an automatic image-level 85/15 split. For final "
-            "measurements, pass --val-data split by patient/specimen."
-        )
+        if args.split_unit == "patch":
+            train_image_indices = None
+            val_image_indices = None
+            patch_pool_per_image = (
+                args.patch_pool_per_image
+                if args.patch_pool_per_image is not None
+                else (
+                    args.train_patches_per_image
+                    + args.val_patches_per_image
+                )
+            )
+            patch_count = sample_count * patch_pool_per_image
+            train_patch_indices, val_patch_indices = (
+                deterministic_split_indices(
+                    patch_count,
+                    args.validation_fraction,
+                    args.seed,
+                )
+            )
+            print(
+                "Warning: using an automatic patch-level split. Training and "
+                "validation contain different deterministic patches from the "
+                "same source images, so validation is not independent by "
+                "patient/specimen."
+            )
+        else:
+            if sample_count < 2:
+                raise RuntimeError(
+                    "An image-level split requires at least two source images"
+                )
+            train_image_indices, val_image_indices = (
+                deterministic_split_indices(
+                    sample_count,
+                    args.validation_fraction,
+                    args.seed,
+                )
+            )
+            print(
+                "Warning: using an automatic image-level split. For final "
+                "measurements, pass --val-data split by patient/specimen."
+            )
 
     if args.cache_training_images and device.type == "cuda":
         all_samples = discover_samples(args.data)
 
         training_samples: list[tuple[Path, Path]] = (
-            [all_samples[index] for index in train_indices]
-            if train_indices is not None
+            [all_samples[index] for index in train_image_indices]
+            if train_image_indices is not None
             else all_samples
         )
 
@@ -693,15 +772,26 @@ def main() -> None:
                 "is available for caching."
             )
 
-    train_dataset = SegmentationDataset(
+    patch_level_split = train_patch_indices is not None
+    if patch_level_split:
+        assert patch_pool_per_image is not None
+    train_base_dataset = SegmentationDataset(
         args.data,
         augment=True,
         crop_size=args.crop_size,
         context_scale=runtime_context_scale,
-        boundary_focus_probability=args.boundary_focus,
-        class_focus_probability=args.class_focus,
-        patches_per_image=args.train_patches_per_image,
-        sample_indices=train_indices,
+        boundary_focus_probability=(
+            0 if patch_level_split else args.boundary_focus
+        ),
+        class_focus_probability=(
+            0 if patch_level_split else args.class_focus
+        ),
+        patches_per_image=(
+            patch_pool_per_image
+            if patch_level_split
+            else args.train_patches_per_image
+        ),
+        sample_indices=train_image_indices,
         cache_device=(
             device
             if args.cache_training_images and device.type == "cuda"
@@ -709,17 +799,37 @@ def main() -> None:
         ),
         cache_handcrafted_features=args.cache_handcrafted_features,
         cache_feature_tile_size=args.cache_feature_tile_size,
+        fixed_patch_centers=patch_level_split,
     )
-    val_dataset = SegmentationDataset(
+    val_base_dataset = SegmentationDataset(
         validation_root,
         augment=False,
         crop_size=args.crop_size,
         context_scale=runtime_context_scale,
         boundary_focus_probability=0,
         class_focus_probability=0,
-        patches_per_image=args.val_patches_per_image,
-        sample_indices=val_indices,
+        patches_per_image=(
+            patch_pool_per_image
+            if patch_level_split
+            else args.val_patches_per_image
+        ),
+        sample_indices=val_image_indices,
+        fixed_patch_centers=patch_level_split,
     )
+    if patch_level_split:
+        assert train_patch_indices is not None
+        assert val_patch_indices is not None
+        train_dataset: Dataset = Subset(
+            train_base_dataset,
+            train_patch_indices,
+        )
+        val_dataset: Dataset = Subset(
+            val_base_dataset,
+            val_patch_indices,
+        )
+    else:
+        train_dataset = train_base_dataset
+        val_dataset = val_base_dataset
     train_workers = (
         0
         if args.cache_training_images and device.type == "cuda"
@@ -739,6 +849,32 @@ def main() -> None:
     val_loader = make_loader(
         val_dataset, args.batch_size, args.workers, False, device.type == "cuda"
     )
+    if patch_level_split:
+        print(
+            f"Patch split: {patch_pool_per_image} deterministic patches/image, "
+            f"{len(train_dataset):,} training and "
+            f"{len(val_dataset):,} validation patches. Boundary/class-focused "
+            "center sampling is disabled so patch ownership stays fixed."
+        )
+    data_split = {
+        "unit": (
+            "external"
+            if args.val_data
+            else ("patch" if patch_level_split else "image")
+        ),
+        "validation_fraction": args.validation_fraction,
+        "patch_pool_per_image": patch_pool_per_image,
+        "train_indices": (
+            train_patch_indices
+            if patch_level_split
+            else train_image_indices
+        ),
+        "validation_indices": (
+            val_patch_indices
+            if patch_level_split
+            else val_image_indices
+        ),
+    }
     optimizer_updates = math.ceil(
         len(train_loader) / args.accumulation_steps
     )
@@ -880,6 +1016,7 @@ def main() -> None:
             "scheduler": scheduler.state_dict(),
             "scaler": scaler.state_dict(),
             "args": vars(args),
+            "data_split": data_split,
         }
         torch.save(checkpoint, args.last_output)
         if val_iou > best_iou:

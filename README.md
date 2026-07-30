@@ -56,15 +56,44 @@ dataset/
 Masks are single-channel PNGs with IDs `0` through `5`; dimensions and stems
 must match the source image. Source images are never globally resized.
 
-Training deliberately samples:
+When a separate `--val-data` directory is supplied, training deliberately
+samples:
 
 - Bone–Fibrocartilage boundary crops
 - Crops centered on a randomly selected foreground class
 - Unbiased random crops
 
 The local crop and its 1:4 context field receive identical geometric and color
-augmentation. For final experiments, provide a validation directory split by
-patient or specimen:
+augmentation.
+
+When `--val-data` is omitted, the default is now a patch-level split. The
+program first defines a deterministic spatial patch pool for every source
+image, randomly assigns 15% of those patch IDs to validation, and only then
+applies training augmentation. A patch ID can never occur in both subsets.
+By default, the pool contains
+`--train-patches-per-image + --val-patches-per-image` patches per image
+(currently six). Configure it explicitly when desired:
+
+```bash
+python train.py \
+  --data /data/tissue/all \
+  --split-unit patch \
+  --patch-pool-per-image 8 \
+  --validation-fraction 0.15 \
+  ...
+```
+
+Patch splitting disables boundary/class-focused center selection because patch
+locations must remain stable across the two dataset views. Flips, rotations,
+and photometric augmentation still apply to training patches after the split.
+Use `--split-unit image` to restore the previous whole-image automatic split.
+The exact assigned indices and patch-pool size are stored under `data_split`
+in every training checkpoint.
+
+Patch-level validation contains neighboring regions and acquisition
+characteristics from the same images as training, so its scores will generally
+be optimistic. For final area-quantification experiments, provide a validation
+directory split by patient or specimen:
 
 ```text
 train_dataset/images + masks

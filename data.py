@@ -284,6 +284,7 @@ class SegmentationDataset(Dataset):
         cache_device: torch.device | None = None,
         cache_handcrafted_features: bool = False,
         cache_feature_tile_size: int = 1024,
+        fixed_patch_centers: bool = False,
     ) -> None:
         if crop_size <= 0 or crop_size % 32:
             raise ValueError("crop_size must be a positive multiple of 32")
@@ -299,6 +300,7 @@ class SegmentationDataset(Dataset):
         self.cache_device = cache_device
         self.cache_handcrafted_features = cache_handcrafted_features
         self.cache_feature_tile_size = cache_feature_tile_size
+        self.fixed_patch_centers = fixed_patch_centers
         if cache_handcrafted_features and cache_device is None:
             raise ValueError(
                 "cache_handcrafted_features requires a CUDA image cache"
@@ -436,11 +438,27 @@ class SegmentationDataset(Dataset):
         self, mask: np.ndarray, patch_number: int, sample_index: int
     ) -> tuple[int, int]:
         height, width = mask.shape
-        if not self.augment:
-            grid = math.ceil(math.sqrt(self.patches_per_image))
-            row, column = divmod(patch_number, grid)
-            center_y = round((row + 0.5) * height / grid)
-            center_x = round((column + 0.5) * width / grid)
+        if self.fixed_patch_centers or not self.augment:
+            # A deterministic spatial pool is required before a patch-level
+            # split. Choose a near-square grid adapted to image aspect ratio.
+            columns = max(
+                1,
+                math.ceil(
+                    math.sqrt(
+                        self.patches_per_image * width / max(height, 1)
+                    )
+                ),
+            )
+            rows = math.ceil(self.patches_per_image / columns)
+            row, column = divmod(patch_number, columns)
+            columns_in_row = min(
+                columns,
+                self.patches_per_image - row * columns,
+            )
+            center_y = round((row + 0.5) * height / rows)
+            center_x = round(
+                (column + 0.5) * width / columns_in_row
+            )
             return min(height - 1, center_y), min(width - 1, center_x)
 
         choice = random.random()
