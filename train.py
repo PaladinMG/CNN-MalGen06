@@ -10,7 +10,8 @@ import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as f
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from data import (
@@ -80,7 +81,7 @@ def multiclass_dice_loss(
 
 def binary_dice_loss(
     probabilities: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
-) -> torch.Tensor:
+) -> int | Tensor:
     intersection = (probabilities * target).sum()
     denominator = probabilities.sum() + target.sum()
     return 1 - (2 * intersection + eps) / (denominator + eps)
@@ -98,7 +99,7 @@ def masked_muscle_loss(
     positives = selected_target.sum()
     negatives = selected_target.numel() - positives
     positive_weight = (negatives / positives.clamp_min(1)).clamp(0.25, 20)
-    return F.binary_cross_entropy_with_logits(
+    return f.binary_cross_entropy_with_logits(
         selected_logits,
         selected_target,
         pos_weight=positive_weight,
@@ -112,7 +113,7 @@ def boundary_loss(
     positives = target.sum()
     negatives = target.numel() - positives
     positive_weight = (negatives / positives.clamp_min(1)).clamp(1, 50)
-    bce = F.binary_cross_entropy_with_logits(
+    bce = f.binary_cross_entropy_with_logits(
         logits.float(), target, pos_weight=positive_weight
     )
     dice = binary_dice_loss(logits.float().sigmoid(), target)
@@ -138,7 +139,7 @@ def complete_loss(
                 class_weights[5],
             ]
         )
-    coarse = F.cross_entropy(
+    coarse = f.cross_entropy(
         outputs["coarse_logits"],
         coarse_targets(mask),
         weight=coarse_weight,
@@ -149,7 +150,7 @@ def complete_loss(
     probabilities = model.probabilities_from_outputs(outputs).float()
     dice = multiclass_dice_loss(probabilities, mask, class_weights)
     boundary_component = boundary_loss(outputs["boundary_logits"], boundary)
-    presence = F.binary_cross_entropy_with_logits(
+    presence = f.binary_cross_entropy_with_logits(
         outputs["muscle_presence_logits"][:, 0],
         muscle_presence.to(outputs["muscle_presence_logits"].dtype),
     )

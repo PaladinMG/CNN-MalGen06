@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
-import torch.nn.functional as F
+import torch.nn.functional as f
 from torchvision.models import (
     ResNet18_Weights,
     ResNet50_Weights,
@@ -104,7 +104,7 @@ class HandcraftedFeatures(nn.Module):
 
     @staticmethod
     def _conv(x: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), kernel)
+        return f.conv2d(f.pad(x, (1, 1, 1, 1), mode="replicate"), kernel)
 
     def forward(self, rgb: torch.Tensor) -> torch.Tensor:
         if rgb.ndim != 4 or rgb.shape[1] != 3:
@@ -115,8 +115,8 @@ class HandcraftedFeatures(nn.Module):
             + 0.7152 * rgb[:, 1:2]
             + 0.0722 * rgb[:, 2:3]
         )
-        derivatives = F.conv2d(
-            F.pad(gray, (1, 1, 1, 1), mode="replicate"),
+        derivatives = f.conv2d(
+            f.pad(gray, (1, 1, 1, 1), mode="replicate"),
             self.derivative_kernels,
         )
         gx, gy, laplace, hxx, hyy, hxy = derivatives.split(1, dim=1)
@@ -132,8 +132,8 @@ class HandcraftedFeatures(nn.Module):
             ],
             dim=1,
         )
-        smoothed = F.conv2d(
-            F.pad(moments, (1, 1, 1, 1), mode="replicate"),
+        smoothed = f.conv2d(
+            f.pad(moments, (1, 1, 1, 1), mode="replicate"),
             self.gaussian_kernels,
             groups=5,
         )
@@ -211,7 +211,7 @@ class DecoderBlock(nn.Module):
         self.refine = ConvBlock(out_channels + skip_channels, out_channels)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(
+        x = f.interpolate(
             x, size=skip.shape[-2:], mode="bilinear", align_corners=False
         )
         x = self.project(x)
@@ -222,7 +222,7 @@ class AccurateTissueNet(nn.Module):
     """
     Accuracy-first dual-scale segmentation model.
 
-    local_rgb contains a native-resolution patch. context_rgb contains the
+    Local_rgb contains a native-resolution patch. Context_rgb contains the
     corresponding context_scale-times-wider field of view resized to the same
     tensor dimensions. Muscle is modeled conditionally inside the combined
     Fibrocartilage-or-Muscle parent class.
@@ -336,7 +336,7 @@ class AccurateTissueNet(nn.Module):
         center = context_features[
             :, :, top : top + crop_height, left : left + crop_width
         ]
-        return F.interpolate(
+        return f.interpolate(
             center, size=output_size, mode="bilinear", align_corners=False
         )
 
@@ -383,7 +383,7 @@ class AccurateTissueNet(nn.Module):
         context = self.context_layer3(context)
         context = self.context_layer4(context)
 
-        context_global = F.adaptive_avg_pool2d(context, 1).flatten(1)
+        context_global = f.adaptive_avg_pool2d(context, 1).flatten(1)
         gamma, beta = self.context_film(context_global).chunk(2, dim=1)
         gamma = 0.1 * torch.tanh(gamma).unsqueeze(-1).unsqueeze(-1)
         beta = 0.1 * beta.unsqueeze(-1).unsqueeze(-1)
@@ -401,7 +401,7 @@ class AccurateTissueNet(nn.Module):
         decoded = self.decode3(decoded, local2)
         decoded = self.decode2(decoded, local1)
         decoded = self.decode1(decoded, stem)
-        decoded = F.interpolate(
+        decoded = f.interpolate(
             decoded,
             size=local_rgb.shape[-2:],
             mode="bilinear",
@@ -409,7 +409,7 @@ class AccurateTissueNet(nn.Module):
         )
         decoded = self.final_refine(decoded)
 
-        pooled_local = F.adaptive_avg_pool2d(local_bottleneck, 1).flatten(1)
+        pooled_local = f.adaptive_avg_pool2d(local_bottleneck, 1).flatten(1)
         presence_logit = self.muscle_presence(
             torch.cat([pooled_local, context_global], dim=1)
         )

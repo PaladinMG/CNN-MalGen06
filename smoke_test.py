@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+import tempfile
 
 import numpy as np
 import torch
+from PIL import Image
 
 from data import (
     SegmentationDataset,
     _color_jitter_tensor,
     _precompute_handcrafted_features,
 )
-from model import AccurateTissueNet
+from model import AccurateTissueNet, CLASS_NAMES
+from predict import PALETTE, prepare_output_layout, save_prediction_images
 from train import (
     batched_color_jitter,
     complete_loss,
@@ -54,16 +58,63 @@ def main() -> None:
     patch_dataset.fixed_patch_centers = True
     dummy_mask = np.zeros((120, 180), dtype=np.uint8)
     training_centers = [
-        patch_dataset._select_center(dummy_mask, patch_id, 0)
+        patch_dataset.select_center(dummy_mask, patch_id, 0)
         for patch_id in range(6)
     ]
     patch_dataset.augment = False
     validation_centers = [
-        patch_dataset._select_center(dummy_mask, patch_id, 0)
+        patch_dataset.select_center(dummy_mask, patch_id, 0)
         for patch_id in range(6)
     ]
     assert training_centers == validation_centers
     assert len(set(training_centers)) == 6
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        output_dir = Path(temporary_directory)
+        layout = prepare_output_layout(output_dir, save_probabilities=True)
+        output_probabilities = np.zeros((6, 12, 18), dtype=np.float32)
+        expected_labels = np.arange(18, dtype=np.uint8)[None] % 6
+        expected_labels = np.repeat(expected_labels, 12, axis=0)
+        for class_id in range(6):
+            output_probabilities[class_id] = expected_labels == class_id
+        output_boundary = np.linspace(
+            0, 1, 12 * 18, dtype=np.float32
+        ).reshape(12, 18)
+        save_prediction_images(
+            output_probabilities,
+            output_boundary,
+            output_dir,
+            layout,
+            "synthetic",
+        )
+        with Image.open(
+            layout["full"] / "synthetic.png"
+        ) as full_segmentation:
+            full_rgb = np.asarray(full_segmentation.convert("RGB"))
+        for class_id in range(6):
+            assert np.array_equal(
+                full_rgb[0, class_id], PALETTE[class_id]
+            )
+            with Image.open(
+                layout[f"{CLASS_NAMES[class_id]}:segmentation"]
+                / "synthetic.png"
+            ) as class_segmentation:
+                rgba = np.asarray(class_segmentation.convert("RGBA"))
+            assert rgba[0, class_id, 3] == 255
+            assert rgba[0, (class_id + 1) % 6, 3] == 0
+            assert (
+                layout[f"{CLASS_NAMES[class_id]}:grayscale"]
+                / "synthetic.png"
+            ).is_file()
+        assert (layout["boundary"] / "synthetic.png").is_file()
+        no_probability_layout = prepare_output_layout(
+            output_dir / "without_probabilities",
+            save_probabilities=False,
+        )
+        assert "probabilities" not in no_probability_layout
+        assert not (
+            output_dir / "without_probabilities" / "Probabilities"
+        ).exists()
 
     model = AccurateTissueNet(pretrained=False)
     if device.type == "cuda":

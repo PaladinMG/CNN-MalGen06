@@ -18,6 +18,13 @@ def main() -> None:
         description="Calculate hard and probability-weighted tissue areas."
     )
     parser.add_argument("--prediction-dir", type=Path, required=True)
+    parser.add_argument(
+        "--prediction-name",
+        help=(
+            "Input/scene stem in the batch layout. Optional when exactly one "
+            "full segmentation exists."
+        ),
+    )
     parser.add_argument("--pixel-width-um", type=float, required=True)
     parser.add_argument("--pixel-height-um", type=float, required=True)
     parser.add_argument("--output", type=Path)
@@ -25,15 +32,44 @@ def main() -> None:
     if args.pixel_width_um <= 0 or args.pixel_height_um <= 0:
         parser.error("Pixel dimensions must be positive")
 
-    label_path = args.prediction_dir / "class_ids.png"
+    legacy_label_path = args.prediction_dir / "class_ids.png"
+    if legacy_label_path.exists():
+        label_path = legacy_label_path
+        prediction_name = "prediction"
+        probability_path = args.prediction_dir / "probabilities.npy"
+    else:
+        full_dir = args.prediction_dir / "Full Segmentations"
+        if args.prediction_name:
+            prediction_name = args.prediction_name
+            label_path = full_dir / f"{prediction_name}.png"
+            if not label_path.exists():
+                raise FileNotFoundError(label_path)
+        else:
+            candidates = sorted(full_dir.glob("*.png"))
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"Found {len(candidates)} full segmentations; pass "
+                    "--prediction-name to choose one"
+                )
+            label_path = candidates[0]
+            prediction_name = label_path.stem
+        probability_path = (
+            args.prediction_dir
+            / "Probabilities"
+            / f"{prediction_name}.npy"
+        )
     with Image.open(label_path) as label_image:
-        labels = np.array(label_image.convert("L"), dtype=np.uint8, copy=True)
+        if label_image.mode not in {"P", "L", "I"}:
+            raise ValueError(
+                f"{label_path} does not preserve indexed class IDs "
+                f"(mode={label_image.mode})"
+            )
+        labels = np.array(label_image, dtype=np.uint8, copy=True)
     height, width = labels.shape
     hard_pixels = np.bincount(
         labels.reshape(-1), minlength=len(CLASS_NAMES)
     ).astype(np.float64)
 
-    probability_path = args.prediction_dir / "probabilities.npy"
     expected_pixels = np.full(len(CLASS_NAMES), np.nan, dtype=np.float64)
     if probability_path.exists():
         probabilities = np.load(probability_path, mmap_mode="r")
@@ -53,7 +89,11 @@ def main() -> None:
     )
     hard_tissue_pixels = hard_pixels[:-1].sum()
     expected_tissue_pixels = np.nansum(expected_pixels[:-1])
-    output = args.output or args.prediction_dir / "area_summary.csv"
+    output = args.output or (
+        args.prediction_dir
+        / "Area Summaries"
+        / f"{prediction_name}.csv"
+    )
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as output_file:
         writer = csv.writer(output_file)

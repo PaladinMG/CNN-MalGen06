@@ -9,10 +9,10 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from torchvision.transforms.v2 import functional as TF
+from torchvision.transforms.v2 import functional as tf
 from torchvision.transforms import InterpolationMode
 
-import torch.nn.functional as F
+import torch.nn.functional as f
 
 from collections.abc import Sequence
 
@@ -129,9 +129,9 @@ def _extract_centered_tensor(
             pad_bottom,
         )
         if constant_value is None:
-            crop = F.pad(crop, padding, mode="replicate")
+            crop = f.pad(crop, padding, mode="replicate")
         else:
-            crop = F.pad(
+            crop = f.pad(
                 crop,
                 padding,
                 mode="constant",
@@ -385,7 +385,7 @@ class SegmentationDataset(Dataset):
                     context_width = math.ceil(
                         image_tensor.shape[2] / self.context_scale
                     )
-                    context_tensor = TF.resize(
+                    context_tensor = tf.resize(
                         image_tensor,
                         [context_height, context_width],
                         interpolation=InterpolationMode.BICUBIC,
@@ -434,7 +434,7 @@ class SegmentationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples) * self.patches_per_image
 
-    def _select_center(
+    def select_center(
         self, mask: np.ndarray, patch_number: int, sample_index: int
     ) -> tuple[int, int]:
         height, width = mask.shape
@@ -577,7 +577,7 @@ class SegmentationDataset(Dataset):
                     f"{mask_path} contains class IDs outside 0..5"
                 )
 
-        center_y, center_x = self._select_center(
+        center_y, center_x = self.select_center(
             mask, patch_number, sample_index
         )
         local = _extract_centered_tensor(
@@ -626,7 +626,7 @@ class SegmentationDataset(Dataset):
                 center_x,
                 self.crop_size * self.context_scale,
             )
-            context = TF.resize(
+            context = tf.resize(
                 context_native,
                 [self.crop_size, self.crop_size],
                 interpolation=InterpolationMode.BICUBIC,

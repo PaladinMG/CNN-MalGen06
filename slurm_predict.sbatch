@@ -9,8 +9,15 @@
 
 set -euo pipefail
 
-: "${IMAGE:?Set IMAGE to the source image}"
 : "${CHECKPOINT:?Set CHECKPOINT to the trained checkpoint}"
+if [[ -z "${IMAGE:-}" && -z "${INPUT_DIR:-}" ]]; then
+    echo "Set either IMAGE or INPUT_DIR" >&2
+    exit 2
+fi
+if [[ -n "${IMAGE:-}" && -n "${INPUT_DIR:-}" ]]; then
+    echo "Set IMAGE or INPUT_DIR, not both" >&2
+    exit 2
+fi
 
 VENV="${VENV:-.venv}"
 OUTPUT_DIR="${OUTPUT_DIR:-prediction}"
@@ -27,7 +34,6 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-8}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 ARGS=(
-    --image "${IMAGE}"
     --checkpoint "${CHECKPOINT}"
     --output-dir "${OUTPUT_DIR}"
     --device cuda
@@ -35,6 +41,18 @@ ARGS=(
     --overlap "${OVERLAP}"
     --batch-size "${BATCH_SIZE}"
 )
+
+if [[ -n "${IMAGE:-}" ]]; then
+    ARGS+=(--image "${IMAGE}")
+else
+    ARGS+=(--input-dir "${INPUT_DIR}")
+fi
+if [[ "${RECURSIVE:-0}" == "1" ]]; then
+    ARGS+=(--recursive)
+fi
+if [[ -n "${CZI_SCENE:-}" ]]; then
+    ARGS+=(--czi-scene "${CZI_SCENE}")
+fi
 
 if [[ "${NO_SAVE_PROBABILITIES:-0}" == "1" ]]; then
     ARGS+=(--no-save-probabilities)

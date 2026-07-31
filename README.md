@@ -3,14 +3,14 @@
 This project predicts six mutually exclusive tissue probabilities at every
 native-resolution pixel:
 
-| ID | Class |
-|---:|---|
-| 0 | Bone |
-| 1 | Fibrocartilage |
-| 2 | Cartilage |
-| 3 | Muscle |
-| 4 | Marrow |
-| 5 | Background |
+| ID | Class          |
+|---:|----------------|
+|  0 | Bone           |
+|  1 | Fibrocartilage |
+|  2 | Cartilage      |
+|  3 | Muscle         |
+|  4 | Marrow         |
+|  5 | Background     |
 
 The current architecture is intended for an NVIDIA RTX 4000 Ada-class GPU. Old
 `TinyFeatureUNet` checkpoints are not compatible and must be retrained.
@@ -230,7 +230,7 @@ python train.py ... --resume last_model.pt
 ```
 
 The encoder learning rate defaults to `3e-5`, while new decoder and task heads
-use `3e-4`. The objective combines hierarchical cross-entropy, conditional
+use `3e-4`. The goal combines hierarchical cross-entropy, conditional
 Muscle loss, six-class Dice, Bone–Fibrocartilage boundary loss, and regional
 Muscle-presence loss. Validation reports class IoU and boundary F1.
 
@@ -245,9 +245,11 @@ blindly.
 
 ## Native-resolution prediction
 
+Single raster image or CZI file:
+
 ```bash
 python predict.py \
-  --image specimen.tif \
+  --image specimen.czi \
   --checkpoint best_model.pt \
   --output-dir prediction \
   --device cuda \
@@ -256,31 +258,77 @@ python predict.py \
   --batch-size 2
 ```
 
+Batch all CZI files in a directory:
+
+```bash
+python predict.py \
+  --input-dir /data/czi \
+  --recursive \
+  --checkpoint best_model.pt \
+  --output-dir prediction \
+  --device cuda \
+  --tile-size 512 \
+  --overlap 128 \
+  --batch-size 2
+```
+
+Every CZI scene is processed by default. Use `--czi-scene 0` to select only
+one zero-based scene. The reader uses full-resolution CZI region reads, selects
+the first T/Z/other plane, retains the first three C channels when present,
+and treats empty mosaic regions as white. It does not expand a whole mosaic in
+RAM.
+
 For higher-context inference, try `--tile-size 768 --overlap 192` or
 `--tile-size 1024 --overlap 256` after measuring VRAM. Tile size must be a
 multiple of 32. Larger inference tiles do not replace training at an adequate
 native crop size.
 
-Outputs:
+The shared batch output layout is:
 
-- `class_ids.png`
-- `color_mask.png`
-- Six grayscale class-probability PNGs
-- `bone_fibro_boundary.png`
-- `probabilities.npy`, shape `[6, original_height, original_width]`
-- `classes.txt`
+```text
+prediction/
+  Bone/
+    Grayscale/<input-or-scene>.png
+    Segmentation/<input-or-scene>.png
+  Fibrocartilage/{Grayscale,Segmentation}/...
+  Cartilage/{Grayscale,Segmentation}/...
+  Muscle/{Grayscale,Segmentation}/...
+  Marrow/{Grayscale,Segmentation}/...
+  Background/{Grayscale,Segmentation}/...
+  Boundary/<input-or-scene>.png
+  Probabilities/<input-or-scene>.npy
+  Full Segmentations/<input-or-scene>.png
+  classes.txt
+```
+
+`Grayscale` contains the normal 8-bit class-probability image.
+`Segmentation` contains only pixels whose final hard prediction is that class;
+all other pixels are transparent. `Full Segmentations` contains the complete
+indexed color segmentation. The exact colors are:
+
+- Bone: dark blue `#003B73`
+- Fibrocartilage: light blue `#79C7FF`
+- Cartilage: dark red `#8B0000`
+- Muscle: light pink `#FFB6C1`
+- Marrow: dark purple `#800080`
+- Background: white `#FFFFFF`
 
 Load the probability volume without placing it entirely in RAM:
 
 ```python
 import numpy as np
 
-probabilities = np.load("prediction/probabilities.npy", mmap_mode="r")
+probabilities = np.load(
+    "prediction/Probabilities/specimen.npy", mmap_mode="r"
+)
 ```
 
-Use `--no-save-probabilities` if only PNG outputs are needed. Stitching still
-uses a temporary disk-backed float32 array. Allow roughly 28 temporary bytes per
-source pixel for six probabilities, the boundary map, and blending weights.
+Use `--no-save-probabilities` if only PNG outputs are needed; the
+`Probabilities` folder is then omitted. Stitching still uses a temporary
+disk-backed float32 array. Allow roughly 28 temporary bytes per source pixel
+for six probabilities, the boundary map, and blending weights. Whole-slide
+CZI prediction can therefore require tens of gigabytes of temporary disk even
+though RAM usage stays bounded.
 
 ## Area quantification
 
@@ -289,11 +337,14 @@ Supply the calibrated physical pixel dimensions from the acquisition metadata:
 ```bash
 python quantify.py \
   --prediction-dir prediction \
+  --prediction-name specimen \
   --pixel-width-um 0.50 \
   --pixel-height-um 0.50
 ```
 
-`area_summary.csv` reports hard-mask and probability-weighted areas in mm².
+`--prediction-name` may be omitted when the folder contains exactly one full
+segmentation. `Area Summaries/<prediction-name>.csv` reports hard-mask and
+probability-weighted areas in mm².
 Validate both against expert specimen-level areas. Do not apply erosion,
 dilation, opening, or closing unless its class-specific area bias has been
 measured.
@@ -335,6 +386,16 @@ IMAGE=/data/specimen.tif,\
 CHECKPOINT=/work/checkpoints/best_model.pt,\
 OUTPUT_DIR=/work/results/specimen,\
 VENV=/work/project/.venv \
+slurm_predict.sbatch
+```
+
+Submit a CZI directory batch:
+
+```bash
+sbatch --export=ALL,\
+INPUT_DIR=/data/czi,RECURSIVE=1,\
+CHECKPOINT=/work/checkpoints/best_model.pt,\
+OUTPUT_DIR=/work/results/batch,VENV=/work/project/.venv \
 slurm_predict.sbatch
 ```
 
