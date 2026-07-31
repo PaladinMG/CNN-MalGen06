@@ -14,7 +14,12 @@ from data import (
     _precompute_handcrafted_features,
 )
 from model import AccurateTissueNet, CLASS_NAMES
-from predict import PALETTE, prepare_output_layout, save_prediction_images
+from predict import (
+    CziImageSource,
+    PALETTE,
+    prepare_output_layout,
+    save_prediction_images,
+)
 from train import (
     batched_color_jitter,
     complete_loss,
@@ -41,6 +46,52 @@ def main() -> None:
     )
     amp = device.type == "cuda"
     torch.manual_seed(7)
+
+    class FakeCziSelection:
+        def __init__(self, shape: tuple[int, int, int]) -> None:
+            self.shape = shape
+
+        def asarray(self, fillvalue: int) -> np.ndarray:
+            return np.full(self.shape, fillvalue, dtype=np.uint8)
+
+    class FakeCziScene:
+        dims = ("Y", "X", "S")
+        pixeltype = "Bgr24"
+        coords = {"S": ["Red", "Green", "Blue"]}
+
+        def __init__(
+            self,
+            bbox: tuple[int, int, int, int],
+            reduction: int,
+        ) -> None:
+            self.bbox = bbox
+            self.reduction = reduction
+            self.levels: list[FakeCziScene] = []
+            self.last_roi: tuple[int, int, int, int] | None = None
+
+        def __call__(self, *, roi: tuple[int, int, int, int]) -> FakeCziSelection:
+            self.last_roi = roi
+            _, _, width, height = roi
+            return FakeCziSelection(
+                (
+                    max(1, round(height / self.reduction)),
+                    max(1, round(width / self.reduction)),
+                    3,
+                )
+            )
+
+    fake_base = FakeCziScene((100, 200, 4096, 2048), reduction=1)
+    fake_quarter = FakeCziScene((25, 50, 1024, 512), reduction=4)
+    fake_base.levels = [fake_base, fake_quarter]
+    fake_source = CziImageSource(fake_base)
+    fake_context = fake_source.read_context(
+        center_y=800,
+        center_x=1600,
+        native_size=512,
+        output_size=128,
+    )
+    assert fake_context.shape == (128, 128, 3)
+    assert fake_quarter.last_roi == (1444, 744, 512, 512)
 
     train_patch_ids, val_patch_ids = deterministic_split_indices(
         item_count=60,

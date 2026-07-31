@@ -136,6 +136,88 @@ class CziImageSource:
             return np.full((height, width, 3), 255, dtype=np.uint8)
         return self._to_rgb(array)
 
+    def _read_base_region_at_this_level(
+        self,
+        base_source: "CziImageSource",
+        top: int,
+        left: int,
+        height: int,
+        width: int,
+    ) -> np.ndarray:
+        """Read a base-coordinate ROI from this pyramid level.
+
+        czifile reports each pyramid level's downsampled dimensions, but its
+        ``roi=`` argument remains in level-zero CZI coordinates. Translating
+        the ROI through ``read_region`` would therefore divide its position
+        and size twice and sample the wrong part of the slide.
+        """
+        scale_y = self.height / base_source.height
+        scale_x = self.width / base_source.width
+        output_height = max(1, round(height * scale_y))
+        output_width = max(1, round(width * scale_x))
+
+        source_top = max(0, top)
+        source_left = max(0, left)
+        source_bottom = min(base_source.height, top + height)
+        source_right = min(base_source.width, left + width)
+        if source_bottom <= source_top or source_right <= source_left:
+            return np.full(
+                (output_height, output_width, 3), 255, dtype=np.uint8
+            )
+
+        absolute_roi = (
+            base_source.x + source_left,
+            base_source.y + source_top,
+            source_right - source_left,
+            source_bottom - source_top,
+        )
+        try:
+            array = self.scene(roi=absolute_roi).asarray(fillvalue=255)
+        except ValueError as error:
+            if "matches no subblocks" not in str(error):
+                raise
+            return np.full(
+                (output_height, output_width, 3), 255, dtype=np.uint8
+            )
+        region = self._to_rgb(array)
+
+        region_top = round((source_top - top) * scale_y)
+        region_left = round((source_left - left) * scale_x)
+        region_bottom = round((source_bottom - top) * scale_y)
+        region_right = round((source_right - left) * scale_x)
+        region_height = max(1, region_bottom - region_top)
+        region_width = max(1, region_right - region_left)
+        if region.shape[:2] != (region_height, region_width):
+            region_image = Image.fromarray(region)
+            try:
+                region = np.array(
+                    region_image.resize(
+                        (region_width, region_height),
+                        Image.Resampling.LANCZOS,
+                        reducing_gap=2.0,
+                    ),
+                    dtype=np.uint8,
+                    copy=True,
+                )
+            finally:
+                region_image.close()
+
+        pad_top = max(0, region_top)
+        pad_left = max(0, region_left)
+        pad_bottom = max(0, output_height - pad_top - region_height)
+        pad_right = max(0, output_width - pad_left - region_width)
+        if pad_top or pad_bottom or pad_left or pad_right:
+            region = np.pad(
+                region,
+                (
+                    (pad_top, pad_bottom),
+                    (pad_left, pad_right),
+                    (0, 0),
+                ),
+                mode="edge",
+            )
+        return np.ascontiguousarray(region[:output_height, :output_width])
+
     def read_context(
         self,
         center_y: int,
@@ -154,19 +236,16 @@ class CziImageSource:
                 )
             ),
         )
-        scale_y = level.height / self.height
-        scale_x = level.width / self.width
-        level_height = max(1, round(native_size * scale_y))
-        level_width = max(1, round(native_size * scale_x))
-        level_center_y = round(center_y * scale_y)
-        level_center_x = round(center_x * scale_x)
-        region = read_padded_region(
-            level,
-            level_center_y - level_height // 2,
-            level_center_x - level_width // 2,
-            level_height,
-            level_width,
-        )
+        top = center_y - native_size // 2
+        left = center_x - native_size // 2
+        if level is self:
+            region = read_padded_region(
+                self, top, left, native_size, native_size
+            )
+        else:
+            region = level._read_base_region_at_this_level(
+                self, top, left, native_size, native_size
+            )
         if region.shape[:2] == (output_size, output_size):
             return region
         context_image = Image.fromarray(region)
