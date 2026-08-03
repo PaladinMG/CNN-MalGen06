@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
+import importlib.metadata
 from itertools import islice, product
+import logging
+import os
 from pathlib import Path
+import platform
+import shutil
+import sys
 import tempfile
+import time
 from typing import Iterator, Protocol
 
 import numpy as np
@@ -16,6 +24,7 @@ from model import AccurateTissueNet, CLASS_NAMES
 
 
 Image.MAX_IMAGE_PIXELS = None
+LOGGER = logging.getLogger("tissue_prediction")
 PALETTE = np.array(
     [
         [0, 59, 115],     # Bone: dark blue
@@ -29,6 +38,143 @@ PALETTE = np.array(
 )
 RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 SUPPORTED_SUFFIXES = RASTER_SUFFIXES | {".czi"}
+
+
+def configure_logging(output_dir: Path, requested_path: Path | None) -> Path:
+    """Configure a flushed console and per-run diagnostic log."""
+    if requested_path is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = output_dir / f"prediction_{timestamp}_pid{os.getpid()}.log"
+    elif requested_path.is_absolute():
+        log_path = requested_path
+    else:
+        log_path = output_dir / requested_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in list(LOGGER.handlers):
+        handler.close()
+        LOGGER.removeHandler(handler)
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = False
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+    LOGGER.addHandler(console_handler)
+    return log_path
+
+
+def _windows_process_metrics() -> dict[str, int]:
+    if os.name != "nt":
+        return {}
+    try:
+        import ctypes
+
+        class ProcessMemoryCountersEx(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.GetProcessHandleCount.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.GetProcessHandleCount.restype = ctypes.c_int
+        psapi.GetProcessMemoryInfo.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ProcessMemoryCountersEx),
+            ctypes.c_ulong,
+        ]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        process = kernel32.GetCurrentProcess()
+        handle_count = ctypes.c_ulong()
+        counters = ProcessMemoryCountersEx()
+        counters.cb = ctypes.sizeof(counters)
+        metrics: dict[str, int] = {}
+        if kernel32.GetProcessHandleCount(
+            process, ctypes.byref(handle_count)
+        ):
+            metrics["handles"] = int(handle_count.value)
+        if psapi.GetProcessMemoryInfo(
+            process, ctypes.byref(counters), counters.cb
+        ):
+            metrics["working_set_bytes"] = int(counters.WorkingSetSize)
+            metrics["private_bytes"] = int(counters.PrivateUsage)
+            metrics["pagefile_bytes"] = int(counters.PagefileUsage)
+        return metrics
+    except Exception:
+        LOGGER.debug("Unable to read Windows process metrics", exc_info=True)
+        return {}
+
+
+def _format_gib(value: int) -> str:
+    return f"{value / (1024 ** 3):.2f} GiB"
+
+
+def log_resource_snapshot(
+    phase: str,
+    output_dir: Path,
+    device: torch.device | None = None,
+) -> None:
+    """Log resources most relevant to long-running Windows batch jobs."""
+    fields = [f"phase={phase}", f"pid={os.getpid()}"]
+    try:
+        disk = shutil.disk_usage(output_dir)
+        fields.extend(
+            [
+                f"disk_free={_format_gib(disk.free)}",
+                f"disk_total={_format_gib(disk.total)}",
+            ]
+        )
+    except OSError:
+        LOGGER.debug("Unable to read output disk usage", exc_info=True)
+    metrics = _windows_process_metrics()
+    if "handles" in metrics:
+        fields.append(f"handles={metrics['handles']}")
+    if "working_set_bytes" in metrics:
+        fields.append(
+            f"working_set={_format_gib(metrics['working_set_bytes'])}"
+        )
+    if "private_bytes" in metrics:
+        fields.append(f"private={_format_gib(metrics['private_bytes'])}")
+    if "pagefile_bytes" in metrics:
+        fields.append(f"pagefile={_format_gib(metrics['pagefile_bytes'])}")
+    if device is not None and device.type == "cuda":
+        fields.extend(
+            [
+                f"cuda_allocated={_format_gib(torch.cuda.memory_allocated())}",
+                f"cuda_reserved={_format_gib(torch.cuda.memory_reserved())}",
+                f"cuda_peak={_format_gib(torch.cuda.max_memory_allocated())}",
+            ]
+        )
+    LOGGER.info("Resources | %s", " | ".join(fields))
+
+
+def _package_version(distribution: str) -> str:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
 
 
 class ImageSource(Protocol):
@@ -298,6 +444,7 @@ def open_image_sources(
             "'python -m pip install -r requirements.txt'."
         ) from error
 
+    LOGGER.info("Opening CZI | path=%s", path)
     czi = czifile.CziFile(path)
     # Reuse recently decoded mosaic subblocks across overlapping local and
     # context ROIs while keeping the cache bounded.
@@ -324,6 +471,7 @@ def open_image_sources(
         ]
     finally:
         czi.close()
+        LOGGER.info("Closed CZI | path=%s", path)
 
 
 def discover_inputs(
@@ -486,6 +634,7 @@ def tiled_prediction(
     context_scale: int,
     probability_path: Path,
     use_amp: bool,
+    log_every_tiles: int,
 ) -> tuple[np.memmap, np.memmap, Path]:
     height, width = source.height, source.width
     y_starts = tile_starts(height, tile_size, overlap)
@@ -493,7 +642,35 @@ def tiled_prediction(
     coordinate_iterator = iter(product(y_starts, x_starts))
     total_tiles = len(y_starts) * len(x_starts)
     window = blend_window(tile_size, overlap)
+    pixels = height * width
+    probability_bytes = (
+        len(CLASS_NAMES) * pixels * np.dtype(np.float32).itemsize
+    )
+    single_map_bytes = pixels * np.dtype(np.float32).itemsize
+    LOGGER.info(
+        "Tile plan | image=%dx%d | tiles=%d | tile_size=%d | overlap=%d "
+        "| batch_size=%d | probability_map=%s | weight_map=%s | "
+        "boundary_map=%s | peak_map_storage=%s",
+        width,
+        height,
+        total_tiles,
+        tile_size,
+        overlap,
+        batch_size,
+        _format_gib(probability_bytes),
+        _format_gib(single_map_bytes),
+        _format_gib(single_map_bytes),
+        _format_gib(probability_bytes + 2 * single_map_bytes),
+    )
+    log_resource_snapshot(
+        "before_memmap_allocation", probability_path.parent, device
+    )
 
+    LOGGER.info(
+        "Creating probability memmap | path=%s | size=%s",
+        probability_path,
+        _format_gib(probability_bytes),
+    )
     probability_sum = np.lib.format.open_memmap(
         probability_path,
         mode="w+",
@@ -501,20 +678,36 @@ def tiled_prediction(
         shape=(len(CLASS_NAMES), height, width),
     )
     probability_sum[:] = 0
+    LOGGER.info("Initialized probability memmap | path=%s", probability_path)
     weight_path = temporary_path(
         probability_path.parent, ".blend_weights_", ".dat"
+    )
+    LOGGER.info(
+        "Creating weight memmap | path=%s | size=%s",
+        weight_path,
+        _format_gib(single_map_bytes),
     )
     weight_sum = np.memmap(
         weight_path, mode="w+", dtype=np.float32, shape=(height, width)
     )
     weight_sum[:] = 0
+    LOGGER.info("Initialized weight memmap | path=%s", weight_path)
     boundary_path = temporary_path(
         probability_path.parent, ".boundary_", ".dat"
+    )
+    LOGGER.info(
+        "Creating boundary memmap | path=%s | size=%s",
+        boundary_path,
+        _format_gib(single_map_bytes),
     )
     boundary_sum = np.memmap(
         boundary_path, mode="w+", dtype=np.float32, shape=(height, width)
     )
     boundary_sum[:] = 0
+    LOGGER.info("Initialized boundary memmap | path=%s", boundary_path)
+    log_resource_snapshot(
+        "after_memmap_allocation", probability_path.parent, device
+    )
 
     pin_memory = device.type == "cuda"
     local_host = torch.empty(
@@ -528,6 +721,8 @@ def tiled_prediction(
         pin_memory=pin_memory,
     )
     processed_tiles = 0
+    prediction_started = time.perf_counter()
+    next_progress_log = min(log_every_tiles, total_tiles)
     try:
         while True:
             coordinates = list(islice(coordinate_iterator, batch_size))
@@ -606,8 +801,35 @@ def tiled_prediction(
                 weight_sum[top:bottom, left:right] += tile_weight
 
             processed_tiles += len(coordinates)
-            if processed_tiles == total_tiles or processed_tiles % 50 == 0:
-                print(f"Processed {processed_tiles}/{total_tiles} tiles")
+            if (
+                processed_tiles >= next_progress_log
+                or processed_tiles == total_tiles
+            ):
+                elapsed = max(time.perf_counter() - prediction_started, 1e-9)
+                tiles_per_second = processed_tiles / elapsed
+                remaining_seconds = (
+                    (total_tiles - processed_tiles) / tiles_per_second
+                    if tiles_per_second > 0
+                    else float("inf")
+                )
+                LOGGER.info(
+                    "Tile progress | processed=%d/%d | percent=%.2f | "
+                    "elapsed_seconds=%.1f | tiles_per_second=%.2f | "
+                    "eta_seconds=%.1f",
+                    processed_tiles,
+                    total_tiles,
+                    100 * processed_tiles / total_tiles,
+                    elapsed,
+                    tiles_per_second,
+                    remaining_seconds,
+                )
+                log_resource_snapshot(
+                    f"tile_progress_{processed_tiles}",
+                    probability_path.parent,
+                    device,
+                )
+                while next_progress_log <= processed_tiles:
+                    next_progress_log += log_every_tiles
             del (
                 local_device,
                 context_device,
@@ -618,6 +840,7 @@ def tiled_prediction(
                 boundaries_cpu,
             )
 
+        LOGGER.info("Normalizing blended probability and boundary maps")
         rows_per_chunk = max(1, min(256, height))
         for top in range(0, height, rows_per_chunk):
             bottom = min(top + rows_per_chunk, height)
@@ -629,8 +852,18 @@ def tiled_prediction(
             np.divide(boundary_block, weights, out=boundary_block)
         probability_sum.flush()
         boundary_sum.flush()
+        LOGGER.info(
+            "Tiled prediction complete | tiles=%d | elapsed_seconds=%.1f",
+            total_tiles,
+            time.perf_counter() - prediction_started,
+        )
         return probability_sum, boundary_sum, boundary_path
     except Exception:
+        LOGGER.exception(
+            "Tiled prediction failed | processed_tiles=%d/%d",
+            processed_tiles,
+            total_tiles,
+        )
         close_memmap(probability_sum)
         close_memmap(boundary_sum)
         boundary_path.unlink(missing_ok=True)
@@ -638,6 +871,7 @@ def tiled_prediction(
     finally:
         close_memmap(weight_sum)
         weight_path.unlink(missing_ok=True)
+        LOGGER.debug("Removed weight memmap | path=%s", weight_path)
 
 
 def save_prediction_images(
@@ -649,8 +883,20 @@ def save_prediction_images(
     rows_per_chunk: int = 256,
 ) -> None:
     _, height, width = probabilities.shape
+    rendering_started = time.perf_counter()
+    LOGGER.info(
+        "Rendering output images | name=%s | dimensions=%dx%d",
+        output_name,
+        width,
+        height,
+    )
     label_buffer_path = temporary_path(output_dir, ".label_buffer_", ".dat")
     image_buffer_path = temporary_path(output_dir, ".image_buffer_", ".dat")
+    LOGGER.debug(
+        "Rendering buffers | labels=%s | image=%s",
+        label_buffer_path,
+        image_buffer_path,
+    )
     label_buffer = np.memmap(
         label_buffer_path, mode="w+", dtype=np.uint8, shape=(height, width)
     )
@@ -718,6 +964,16 @@ def save_prediction_images(
         close_memmap(image_buffer)
         label_buffer_path.unlink(missing_ok=True)
         image_buffer_path.unlink(missing_ok=True)
+        LOGGER.debug(
+            "Removed rendering buffers | labels=%s | image=%s",
+            label_buffer_path,
+            image_buffer_path,
+        )
+    LOGGER.info(
+        "Rendered output images | name=%s | elapsed_seconds=%.1f",
+        output_name,
+        time.perf_counter() - rendering_started,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -751,6 +1007,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--no-save-probabilities", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help=(
+            "Diagnostic log path. Relative paths are placed below "
+            "--output-dir. By default a timestamped log is created there."
+        ),
+    )
+    parser.add_argument(
+        "--log-every-tiles",
+        type=int,
+        default=250,
+        help=(
+            "Write progress and resource metrics every N tiles "
+            "(default: 250)."
+        ),
+    )
     args = parser.parse_args()
     if args.tile_size <= 0 or args.tile_size % 32:
         parser.error("--tile-size must be a positive multiple of 32")
@@ -758,6 +1031,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--overlap must be at least 0 and smaller than --tile-size")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.log_every_tiles <= 0:
+        parser.error("--log-every-tiles must be positive")
     if args.recursive and args.input_dir is None:
         parser.error("--recursive requires --input-dir")
     if args.czi_scene is not None and args.czi_scene < 0:
@@ -765,8 +1040,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = parse_args()
+def run_prediction(args: argparse.Namespace) -> None:
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA was requested but is unavailable. Install a CUDA-enabled "
@@ -778,9 +1052,17 @@ def main() -> None:
         or (args.device == "auto" and torch.cuda.is_available())
         else "cpu"
     )
-    print(f"Using device: {device}")
+    LOGGER.info("Using device | device=%s", device)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        LOGGER.info(
+            "CUDA environment | device_name=%s | cuda_runtime=%s | "
+            "cudnn=%s | device_count=%d",
+            torch.cuda.get_device_name(device),
+            torch.version.cuda,
+            torch.backends.cudnn.version(),
+            torch.cuda.device_count(),
+        )
 
     checkpoint = torch.load(
         args.checkpoint, map_location="cpu", weights_only=False
@@ -797,7 +1079,15 @@ def main() -> None:
         model = model.to(memory_format=torch.channels_last)
     model.to(device).eval()
     context_scale = model.context_scale
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(
+        "Model loaded | checkpoint=%s | context_scale=%d | "
+        "parameters=%d | amp=%s",
+        args.checkpoint,
+        context_scale,
+        sum(parameter.numel() for parameter in model.parameters()),
+        device.type == "cuda" and not args.no_amp,
+    )
+    log_resource_snapshot("model_loaded", args.output_dir, device)
     layout = prepare_output_layout(
         args.output_dir,
         save_probabilities=not args.no_save_probabilities,
@@ -807,10 +1097,32 @@ def main() -> None:
         args.input_dir,
         args.recursive,
     )
+    LOGGER.info(
+        "Discovered inputs | count=%d | input_dir=%s | image=%s | recursive=%s",
+        len(input_paths),
+        args.input_dir,
+        args.image,
+        args.recursive,
+    )
     used_output_names: set[str] = set()
     prediction_count = 0
     for input_index, input_path in enumerate(input_paths, start=1):
-        print(f"Input {input_index}/{len(input_paths)}: {input_path.name}")
+        input_started = time.perf_counter()
+        try:
+            input_size = input_path.stat().st_size
+        except OSError:
+            input_size = -1
+        LOGGER.info(
+            "Input start | index=%d/%d | name=%s | path=%s | file_size=%s",
+            input_index,
+            len(input_paths),
+            input_path.name,
+            input_path,
+            _format_gib(input_size) if input_size >= 0 else "unknown",
+        )
+        log_resource_snapshot(
+            f"input_{input_index}_before_open", args.output_dir, device
+        )
         with open_image_sources(input_path, args.czi_scene) as sources:
             for scene_index, source in sources:
                 output_name = input_path.stem
@@ -828,10 +1140,15 @@ def main() -> None:
                 scene_description = (
                     "" if scene_index is None else f", scene {scene_index}"
                 )
-                print(
-                    f"Predicting {output_name}: {source.width}x{source.height}"
-                    f"{scene_description}"
+                LOGGER.info(
+                    "Scene start | output_name=%s | dimensions=%dx%d%s",
+                    output_name,
+                    source.width,
+                    source.height,
+                    scene_description,
                 )
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
                 probability_path = (
                     temporary_path(
                         args.output_dir, ".probabilities_", ".npy"
@@ -850,6 +1167,7 @@ def main() -> None:
                         context_scale=context_scale,
                         probability_path=probability_path,
                         use_amp=not args.no_amp,
+                        log_every_tiles=args.log_every_tiles,
                     )
                 )
                 try:
@@ -866,8 +1184,30 @@ def main() -> None:
                     boundary_path.unlink(missing_ok=True)
                     if args.no_save_probabilities:
                         probability_path.unlink(missing_ok=True)
+                    LOGGER.debug(
+                        "Closed scene memmaps | probability=%s | boundary=%s "
+                        "| probability_deleted=%s",
+                        probability_path,
+                        boundary_path,
+                        args.no_save_probabilities,
+                    )
                 prediction_count += 1
-                print(f"Completed {output_name}")
+                LOGGER.info("Scene completed | output_name=%s", output_name)
+                log_resource_snapshot(
+                    f"scene_{prediction_count}_completed",
+                    args.output_dir,
+                    device,
+                )
+        LOGGER.info(
+            "Input completed | index=%d/%d | name=%s | elapsed_seconds=%.1f",
+            input_index,
+            len(input_paths),
+            input_path.name,
+            time.perf_counter() - input_started,
+        )
+        log_resource_snapshot(
+            f"input_{input_index}_closed", args.output_dir, device
+        )
 
     classes_text = []
     for class_id, (name, color) in enumerate(zip(CLASS_NAMES, PALETTE)):
@@ -879,10 +1219,43 @@ def main() -> None:
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(
-        f"Saved {prediction_count} prediction(s) from "
-        f"{len(input_paths)} input file(s) to {args.output_dir}"
+    LOGGER.info(
+        "Batch completed | predictions=%d | inputs=%d | output_dir=%s",
+        prediction_count,
+        len(input_paths),
+        args.output_dir,
     )
+
+
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = configure_logging(args.output_dir, args.log_file)
+    LOGGER.info("Prediction run started | log_file=%s", log_path)
+    LOGGER.info("Command | %s", " ".join(sys.argv))
+    LOGGER.info(
+        "Environment | platform=%s | python=%s | numpy=%s | torch=%s | "
+        "torchvision=%s | pillow=%s | czifile=%s | imagecodecs=%s",
+        platform.platform(),
+        sys.version.replace("\n", " "),
+        np.__version__,
+        torch.__version__,
+        _package_version("torchvision"),
+        _package_version("Pillow"),
+        _package_version("czifile"),
+        _package_version("imagecodecs"),
+    )
+    log_resource_snapshot("process_start", args.output_dir)
+    try:
+        run_prediction(args)
+    except BaseException:
+        LOGGER.exception("Prediction run terminated with an error")
+        log_resource_snapshot("process_failure", args.output_dir)
+        raise
+    finally:
+        LOGGER.info("Prediction run finished | log_file=%s", log_path)
+        for handler in LOGGER.handlers:
+            handler.flush()
 
 
 if __name__ == "__main__":
