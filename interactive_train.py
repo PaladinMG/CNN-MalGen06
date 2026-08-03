@@ -416,6 +416,7 @@ def review_with_napari(
 ) -> ReviewDecision:
     try:
         import napari
+        from napari.utils.colormaps import DirectLabelColormap
         from qtpy.QtWidgets import (
             QComboBox,
             QFormLayout,
@@ -445,6 +446,20 @@ def review_with_napari(
     stride = tile.local.shape[1] + 32
     decision = ReviewDecision(action="skip")
 
+    def direct_label_colormap() -> DirectLabelColormap:
+        color_dict = {0: np.array([0, 0, 0, 0], dtype=np.float32)}
+        for label_id, hex_color in LABEL_COLORS.items():
+            color_dict[label_id] = np.array(
+                [
+                    int(hex_color[1:3], 16) / 255,
+                    int(hex_color[3:5], 16) / 255,
+                    int(hex_color[5:7], 16) / 255,
+                    1.0,
+                ],
+                dtype=np.float32,
+            )
+        return DirectLabelColormap(color_dict=color_dict)
+
     viewer = napari.Viewer(
         title=f"Interactive tissue review - epoch {epoch} - {tile.source_name}"
     )
@@ -458,7 +473,7 @@ def review_with_napari(
     viewer.add_labels(
         display_prediction,
         name="2 - Model prediction",
-        color=LABEL_COLORS,
+        colormap=direct_label_colormap(),
         opacity=0.58,
         translate=(0, stride),
     )
@@ -471,7 +486,7 @@ def review_with_napari(
     target_layer = viewer.add_labels(
         display_target,
         name="3 - Training target (editable)",
-        color=LABEL_COLORS,
+        colormap=direct_label_colormap(),
         opacity=0.58,
         translate=(0, 2 * stride),
     )
@@ -816,6 +831,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-feature-tile-size", type=int, default=1024)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help=(
+            "Compile the model with torch.compile on CUDA. Startup is slower, "
+            "but repeated training steps can have less overhead."
+        ),
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
     parser.add_argument("--no-fused-optimizer", action="store_true")
     parser.add_argument("--no-tf32", action="store_true")
     parser.add_argument(
@@ -882,6 +910,8 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = tf32_enabled
         torch.set_float32_matmul_precision("high" if tf32_enabled else "highest")
     else:
+        if args.compile_model:
+            raise RuntimeError("--compile-model is currently supported only on CUDA")
         torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "8")))
     print(f"Using device={device}, AMP={amp}")
     if device.type == "cuda":
@@ -1016,6 +1046,12 @@ def main() -> None:
             scheduler.load_state_dict(checkpoint["scheduler"])
         if "scaler" in checkpoint:
             scaler.load_state_dict(checkpoint["scaler"])
+    if args.compile_model:
+        model.compile(mode=args.compile_mode)
+        print(
+            f"Enabled torch.compile mode={args.compile_mode}; the first "
+            "prediction and training steps will include compilation time."
+        )
     checkpoint_class_weights = checkpoint.get("args", {}).get("class_weights")
     effective_class_weights = args.class_weights or checkpoint_class_weights
     class_weights = (

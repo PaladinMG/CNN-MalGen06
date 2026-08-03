@@ -271,6 +271,8 @@ python interactive_train.py \
   --review-recursive \
   --checkpoint best_model.pt \
   --device cuda \
+  --compile-model \
+  --compile-mode reduce-overhead \
   --crop-size 512 \
   --batch-size 4 \
   --epochs 10 \
@@ -279,6 +281,12 @@ python interactive_train.py \
   --output interactive_best_model.pt \
   --last-output interactive_last_model.pt
 ```
+
+`--compile-model` is optional and CUDA-only. It uses `torch.compile`; expect a
+longer pause before the first interactive prediction and again when the first
+training graph is compiled. `--compile-mode` accepts `default`,
+`reduce-overhead` (the default), or `max-autotune`. Compare completed
+epoch time rather than the first epoch when deciding whether to keep it.
 
 `--data` and `--val-data` still point to annotated raster datasets containing
 matching `images/` and `masks/` directories. `--review-data` is different: it
