@@ -243,6 +243,77 @@ python train.py ... --class-weights 1 2 2 2 1 0.3
 Calculate weights from training-mask pixel counts; do not copy the example
 blindly.
 
+## Interactive Napari fine-tuning
+
+`interactive_train.py` adds a supervised human-in-the-loop stage to an
+existing checkpoint. Before each epoch it selects an unaugmented random
+512×512 tile, predicts it, and opens four linked panels in Napari:
+
+1. the native-resolution local RGB tile;
+2. the model prediction;
+3. the existing training mask, editable with Napari's Labels tools; and
+4. the corresponding `context_scale`-times-wider RGB field, resized to the
+   network input size.
+
+Install the optional GUI dependencies in the same environment as PyTorch:
+
+```bash
+pip install -r requirements-interactive.txt
+```
+
+Start from a trained checkpoint so the first prediction is meaningful:
+
+```bash
+python interactive_train.py \
+  --data /data/tissue/train \
+  --val-data /data/tissue/validation \
+  --review-data /data/czi \
+  --review-recursive \
+  --checkpoint best_model.pt \
+  --device cuda \
+  --crop-size 512 \
+  --batch-size 4 \
+  --epochs 10 \
+  --reviews-per-epoch 1 \
+  --feedback-dir interactive_feedback \
+  --output interactive_best_model.pt \
+  --last-output interactive_last_model.pt
+```
+
+`--data` and `--val-data` still point to annotated raster datasets containing
+matching `images/` and `masks/` directories. `--review-data` is different: it
+accepts one CZI file or a directory of CZI scans and supplies only the tiles
+shown during interactive review. Add `--review-recursive` when scans are in
+nested directories. CZI regions are read on demand at native resolution; the
+whole scan is not loaded into RAM. By default the sampler tries up to 12
+locations and prefers a tile containing at least 2% nonwhite pixels, avoiding
+empty mosaic regions. Configure this with `--review-read-attempts` and
+`--review-min-nonwhite-fraction`.
+
+The score is interpreted as a hard-example signal, not as a replacement for
+the segmentation target. A score of 100 uses the ordinary feedback loss
+weight. Lower scores increase that weight linearly; the default score-zero
+multiplier is 3× (`1 + --hard-example-boost 2`). For a tile sampled from the
+annotated `--data`, the editable mask begins from its existing annotation. A
+CZI review has no mask, so its editable target begins from the prediction and
+must be inspected and corrected before saving. If no edits are detected, the
+script only accepts it with a score of 100, explicitly confirming that every
+pixel was reviewed and is already correct.
+
+Each accepted review is stored as a compressed `.npz` record containing the
+local RGB tile, its exact resized context field, the initial and corrected
+masks, the scored probabilities, CZI scene/coordinates, and context scale. Feedback
+replay passes both saved RGB tensors back to `model(local, context)`, so the
+context encoder and context-dependent Muscle prior participate in the update.
+The most recent 32 records are replayed once per epoch by default. Change this
+with `--feedback-window`; use `0` to replay all records.
+
+Closing the viewer or choosing **Skip tile** does not save feedback. **Stop
+reviews** disables subsequent GUI prompts but lets training finish. To reuse
+previous feedback in a headless or SLURM batch job, add `--no-review`; Napari
+is then not imported. Keep the same `--crop-size` and checkpoint context scale
+that were used when the feedback records were created.
+
 ## Native-resolution prediction
 
 Single raster image or CZI file:
@@ -269,7 +340,8 @@ python predict.py \
   --device cuda \
   --tile-size 512 \
   --overlap 128 \
-  --batch-size 2
+  --batch-size 2 \
+  --temp-in-project-dir
 ```
 
 Every CZI scene is processed by default. Use `--czi-scene 0` to select only
@@ -325,10 +397,18 @@ probabilities = np.load(
 
 Use `--no-save-probabilities` if only PNG outputs are needed; the
 `Probabilities` folder is then omitted. Stitching still uses a temporary
-disk-backed float32 array. Allow roughly 28 temporary bytes per source pixel
+disk-backed float32 array. Allow roughly 32 temporary bytes per source pixel
 for six probabilities, the boundary map, and blending weights. Whole-slide
 CZI prediction can therefore require tens of gigabytes of temporary disk even
 though RAM usage stays bounded.
+
+By default these hidden temporary maps and the two rendering buffers are
+created under `--output-dir`. Add `--temp-in-project-dir` to create them in the
+directory containing `predict.py` instead. This leaves the output directory
+free of the large hidden working files while a scene is running. Temporary
+maps are deleted after each scene; saved PNGs and an explicitly retained
+`Probabilities/*.npy` remain in `--output-dir`. Make sure the project drive has
+enough free space before using the flag.
 
 ## Area quantification
 

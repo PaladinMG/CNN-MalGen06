@@ -1,0 +1,2 @@
+-r requirements.txt
+napari[pyqt6,optional]>=0.8.0,<0.9

@@ -553,6 +553,98 @@ def close_memmap(array: np.memmap) -> None:
         memory_map.close()
 
 
+def allocate_prediction_memmaps(
+    probability_path: Path,
+    temporary_dir: Path,
+    height: int,
+    width: int,
+    probability_bytes: int,
+    single_map_bytes: int,
+) -> tuple[np.memmap, np.memmap, Path, np.memmap, Path]:
+    """Allocate the three blending maps and remove partial files on failure."""
+    probability_sum: np.memmap | None = None
+    weight_sum: np.memmap | None = None
+    boundary_sum: np.memmap | None = None
+    weight_path: Path | None = None
+    boundary_path: Path | None = None
+    try:
+        LOGGER.info(
+            "Creating probability memmap | path=%s | size=%s",
+            probability_path,
+            _format_gib(probability_bytes),
+        )
+        probability_sum = np.lib.format.open_memmap(
+            probability_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(len(CLASS_NAMES), height, width),
+        )
+        probability_sum[:] = 0
+        LOGGER.info("Initialized probability memmap | path=%s", probability_path)
+
+        weight_path = temporary_path(
+            temporary_dir, ".blend_weights_", ".dat"
+        )
+        LOGGER.info(
+            "Creating weight memmap | path=%s | size=%s",
+            weight_path,
+            _format_gib(single_map_bytes),
+        )
+        weight_sum = np.memmap(
+            weight_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(height, width),
+        )
+        weight_sum[:] = 0
+        LOGGER.info("Initialized weight memmap | path=%s", weight_path)
+
+        boundary_path = temporary_path(
+            temporary_dir, ".boundary_", ".dat"
+        )
+        LOGGER.info(
+            "Creating boundary memmap | path=%s | size=%s",
+            boundary_path,
+            _format_gib(single_map_bytes),
+        )
+        boundary_sum = np.memmap(
+            boundary_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(height, width),
+        )
+        boundary_sum[:] = 0
+        LOGGER.info("Initialized boundary memmap | path=%s", boundary_path)
+        return (
+            probability_sum,
+            weight_sum,
+            weight_path,
+            boundary_sum,
+            boundary_path,
+        )
+    except Exception:
+        LOGGER.exception("Failed while allocating prediction memmaps")
+        for array in (probability_sum, weight_sum, boundary_sum):
+            if array is not None:
+                try:
+                    close_memmap(array)
+                except Exception:
+                    LOGGER.debug(
+                        "Unable to close a partial memmap", exc_info=True
+                    )
+        for path in (probability_path, weight_path, boundary_path):
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.debug(
+                        "Unable to remove partial memmap | path=%s",
+                        path,
+                        exc_info=True,
+                    )
+        raise
+
+
 def read_padded_region(
     source: ImageSource,
     top: int,
@@ -633,6 +725,7 @@ def tiled_prediction(
     batch_size: int,
     context_scale: int,
     probability_path: Path,
+    temporary_dir: Path,
     use_amp: bool,
     log_every_tiles: int,
 ) -> tuple[np.memmap, np.memmap, Path]:
@@ -663,50 +756,24 @@ def tiled_prediction(
         _format_gib(probability_bytes + 2 * single_map_bytes),
     )
     log_resource_snapshot(
-        "before_memmap_allocation", probability_path.parent, device
+        "before_memmap_allocation", temporary_dir, device
     )
-
-    LOGGER.info(
-        "Creating probability memmap | path=%s | size=%s",
-        probability_path,
-        _format_gib(probability_bytes),
-    )
-    probability_sum = np.lib.format.open_memmap(
-        probability_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=(len(CLASS_NAMES), height, width),
-    )
-    probability_sum[:] = 0
-    LOGGER.info("Initialized probability memmap | path=%s", probability_path)
-    weight_path = temporary_path(
-        probability_path.parent, ".blend_weights_", ".dat"
-    )
-    LOGGER.info(
-        "Creating weight memmap | path=%s | size=%s",
+    (
+        probability_sum,
+        weight_sum,
         weight_path,
-        _format_gib(single_map_bytes),
-    )
-    weight_sum = np.memmap(
-        weight_path, mode="w+", dtype=np.float32, shape=(height, width)
-    )
-    weight_sum[:] = 0
-    LOGGER.info("Initialized weight memmap | path=%s", weight_path)
-    boundary_path = temporary_path(
-        probability_path.parent, ".boundary_", ".dat"
-    )
-    LOGGER.info(
-        "Creating boundary memmap | path=%s | size=%s",
+        boundary_sum,
         boundary_path,
-        _format_gib(single_map_bytes),
+    ) = allocate_prediction_memmaps(
+        probability_path,
+        temporary_dir,
+        height,
+        width,
+        probability_bytes,
+        single_map_bytes,
     )
-    boundary_sum = np.memmap(
-        boundary_path, mode="w+", dtype=np.float32, shape=(height, width)
-    )
-    boundary_sum[:] = 0
-    LOGGER.info("Initialized boundary memmap | path=%s", boundary_path)
     log_resource_snapshot(
-        "after_memmap_allocation", probability_path.parent, device
+        "after_memmap_allocation", temporary_dir, device
     )
 
     pin_memory = device.type == "cuda"
@@ -867,6 +934,7 @@ def tiled_prediction(
         close_memmap(probability_sum)
         close_memmap(boundary_sum)
         boundary_path.unlink(missing_ok=True)
+        probability_path.unlink(missing_ok=True)
         raise
     finally:
         close_memmap(weight_sum)
@@ -877,7 +945,7 @@ def tiled_prediction(
 def save_prediction_images(
     probabilities: np.memmap,
     boundary_probability: np.memmap,
-    output_dir: Path,
+    temporary_dir: Path,
     layout: dict[str, Path],
     output_name: str,
     rows_per_chunk: int = 256,
@@ -890,8 +958,12 @@ def save_prediction_images(
         width,
         height,
     )
-    label_buffer_path = temporary_path(output_dir, ".label_buffer_", ".dat")
-    image_buffer_path = temporary_path(output_dir, ".image_buffer_", ".dat")
+    label_buffer_path = temporary_path(
+        temporary_dir, ".label_buffer_", ".dat"
+    )
+    image_buffer_path = temporary_path(
+        temporary_dir, ".image_buffer_", ".dat"
+    )
     LOGGER.debug(
         "Rendering buffers | labels=%s | image=%s",
         label_buffer_path,
@@ -1006,6 +1078,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlap", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--no-save-probabilities", action="store_true")
+    parser.add_argument(
+        "--temp-in-project-dir",
+        action="store_true",
+        help=(
+            "Place temporary memmaps beside predict.py instead of below "
+            "--output-dir. Permanent output images still use --output-dir."
+        ),
+    )
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
         "--log-file",
@@ -1151,7 +1231,7 @@ def run_prediction(args: argparse.Namespace) -> None:
                     torch.cuda.reset_peak_memory_stats(device)
                 probability_path = (
                     temporary_path(
-                        args.output_dir, ".probabilities_", ".npy"
+                        args.temporary_dir, ".probabilities_", ".npy"
                     )
                     if args.no_save_probabilities
                     else layout["probabilities"] / f"{output_name}.npy"
@@ -1166,6 +1246,7 @@ def run_prediction(args: argparse.Namespace) -> None:
                         batch_size=args.batch_size,
                         context_scale=context_scale,
                         probability_path=probability_path,
+                        temporary_dir=args.temporary_dir,
                         use_amp=not args.no_amp,
                         log_every_tiles=args.log_every_tiles,
                     )
@@ -1174,7 +1255,7 @@ def run_prediction(args: argparse.Namespace) -> None:
                     save_prediction_images(
                         probabilities,
                         boundary_probability,
-                        args.output_dir,
+                        args.temporary_dir,
                         layout,
                         output_name,
                     )
@@ -1230,9 +1311,20 @@ def run_prediction(args: argparse.Namespace) -> None:
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.temporary_dir = (
+        Path(__file__).resolve().parent
+        if args.temp_in_project_dir
+        else args.output_dir.resolve()
+    )
+    args.temporary_dir.mkdir(parents=True, exist_ok=True)
     log_path = configure_logging(args.output_dir, args.log_file)
     LOGGER.info("Prediction run started | log_file=%s", log_path)
     LOGGER.info("Command | %s", " ".join(sys.argv))
+    LOGGER.info(
+        "Temporary workspace | path=%s | in_project_dir=%s",
+        args.temporary_dir,
+        args.temp_in_project_dir,
+    )
     LOGGER.info(
         "Environment | platform=%s | python=%s | numpy=%s | torch=%s | "
         "torchvision=%s | pillow=%s | czifile=%s | imagecodecs=%s",
