@@ -581,7 +581,7 @@ def review_with_napari(
         corrected_display = np.asarray(target_layer.data)
         if (
             corrected_display.ndim != 2
-            or corrected_display.shape != tile.target.shape
+            or corrected_display.shape != display_target.shape
             or corrected_display.min() < 1
             or corrected_display.max() > len(CLASS_NAMES)
         ):
