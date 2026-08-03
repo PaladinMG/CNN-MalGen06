@@ -386,6 +386,8 @@ def run_epoch(
     scaler: torch.cuda.amp.GradScaler | None = None,
     accumulation_steps: int = 1,
     gradient_clip: float = 1.0,
+    progress_every_batches: int = 0,
+    progress_label: str | None = None,
 ) -> tuple[float, float, list[float], float, dict[str, float]]:
     training = optimizer is not None
     model.train(training)
@@ -394,6 +396,7 @@ def run_epoch(
     components: dict[str, float] = defaultdict(float)
     if training:
         optimizer.zero_grad(set_to_none=True)
+    epoch_started = time.perf_counter()
 
     for batch_index, batch in enumerate(loader):
         local = batch["local"].to(device, non_blocking=True)
@@ -461,6 +464,20 @@ def run_epoch(
             outputs["boundary_logits"].detach().sigmoid(),
             boundary,
         )
+        completed = batch_index + 1
+        if (
+            progress_label
+            and progress_every_batches > 0
+            and (
+                completed % progress_every_batches == 0
+                or completed == len(loader)
+            )
+        ):
+            print(
+                f"{progress_label}: {completed}/{len(loader)} batch(es) "
+                f"complete ({time.perf_counter() - epoch_started:.1f}s)",
+                flush=True,
+            )
 
     batches = len(loader)
     mean_iou, per_class, boundary_f1 = metrics.results()
@@ -587,6 +604,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--context-scale must be at least 1")
     if args.batch_size < 1 or args.accumulation_steps < 1:
         parser.error("Batch and accumulation sizes must be positive")
+    if args.train_patches_per_image < 1 or args.val_patches_per_image < 1:
+        parser.error("Patch counts per image must be positive")
     if not 0 < args.validation_fraction < 1:
         parser.error("--validation-fraction must be between 0 and 1")
     if (

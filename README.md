@@ -298,6 +298,22 @@ locations and prefers a tile containing at least 2% nonwhite pixels, avoiding
 empty mosaic regions. Configure this with `--review-read-attempts` and
 `--review-min-nonwhite-fraction`.
 
+When `--val-data` is omitted, interactive training now uses the same default
+patch-level split as `train.py`. Configure it with `--split-unit patch`,
+`--patch-pool-per-image`, and `--validation-fraction`, or choose
+`--split-unit image` for a whole-image split. The split is stored in the
+interactive checkpoint under `data_split`. If reviews come from annotated
+`--data` rather than CZI files, review tiles are restricted to training-owned
+patch IDs and cannot select a validation-owned patch.
+
+Interactive tile selection uses a fresh operating-system random seed on every
+run, independent of the deterministic `--seed` used for training. The seed is
+printed, stored in feedback/checkpoint metadata, and can be replayed with
+`--review-seed SEED`. After Save, the script reopens and verifies the saved
+local image, context image, and corrected target before starting training.
+Timestamped progress is printed throughout review, training, feedback replay,
+and validation; adjust its frequency with `--progress-every-batches`.
+
 The score is interpreted as a hard-example signal, not as a replacement for
 the segmentation target. A score of 100 uses the ordinary feedback loss
 weight. Lower scores increase that weight linearly; the default score-zero

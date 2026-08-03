@@ -265,6 +265,37 @@ def _precompute_handcrafted_features(
             )
     return output
 
+
+def fixed_patch_center(
+    height: int,
+    width: int,
+    patch_number: int,
+    patches_per_image: int,
+) -> tuple[int, int]:
+    """Return the stable near-grid center for one patch in an image pool."""
+    if height < 1 or width < 1:
+        raise ValueError("Image dimensions must be positive")
+    if patches_per_image < 1:
+        raise ValueError("patches_per_image must be positive")
+    if not 0 <= patch_number < patches_per_image:
+        raise IndexError("patch_number is outside the patch pool")
+    columns = max(
+        1,
+        math.ceil(
+            math.sqrt(patches_per_image * width / max(height, 1))
+        ),
+    )
+    rows = math.ceil(patches_per_image / columns)
+    row, column = divmod(patch_number, columns)
+    columns_in_row = min(
+        columns,
+        patches_per_image - row * columns,
+    )
+    center_y = round((row + 0.5) * height / rows)
+    center_x = round((column + 0.5) * width / columns_in_row)
+    return min(height - 1, center_y), min(width - 1, center_x)
+
+
 class SegmentationDataset(Dataset):
     """
     Returns aligned native-resolution local crops, 1:context_scale context crops
@@ -441,25 +472,12 @@ class SegmentationDataset(Dataset):
         if self.fixed_patch_centers or not self.augment:
             # A deterministic spatial pool is required before a patch-level
             # split. Choose a near-square grid adapted to image aspect ratio.
-            columns = max(
-                1,
-                math.ceil(
-                    math.sqrt(
-                        self.patches_per_image * width / max(height, 1)
-                    )
-                ),
+            return fixed_patch_center(
+                height,
+                width,
+                patch_number,
+                self.patches_per_image,
             )
-            rows = math.ceil(self.patches_per_image / columns)
-            row, column = divmod(patch_number, columns)
-            columns_in_row = min(
-                columns,
-                self.patches_per_image - row * columns,
-            )
-            center_y = round((row + 0.5) * height / rows)
-            center_x = round(
-                (column + 0.5) * width / columns_in_row
-            )
-            return min(height - 1, center_y), min(width - 1, center_x)
 
         choice = random.random()
         if choice < self.boundary_focus_probability:
