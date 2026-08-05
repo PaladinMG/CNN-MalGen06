@@ -15,6 +15,67 @@ python -m pip install -r requirements.txt
 The additional quantification dependencies are SciPy, scikit-image, and
 openpyxl. The script does not require a GPU.
 
+## Optional NVIDIA GPU acceleration
+
+`--device auto` is the default. It uses CUDA when available and otherwise runs
+the complete CPU implementation. To require CUDA and fail immediately when it
+cannot initialize, use `--device cuda`. To reproduce a CPU-only run even on a
+GPU workstation, use `--device cpu`.
+
+The existing CUDA-enabled PyTorch installation accelerates native-resolution
+probability totals, entropy, top-two margins, ambiguity masks, and hard-region
+confidence reductions. Install the optional CUDA 12 requirements to also use
+CuPy for exact Euclidean distance transforms, connected-component labeling,
+binary morphology, convolution, Sobel and Gaussian filtering, structure-tensor
+features, and Hessian ridge features:
+
+```powershell
+python -m pip install -r requirements-gpu.txt
+```
+
+`requirements-gpu.txt` uses the official `cupy-cuda12x[ctk]` package so a
+system-wide CUDA Toolkit is not required when a compatible NVIDIA driver is
+already installed. Do not install multiple CuPy variants in one environment.
+For a CUDA 13 environment, install the matching `cupy-cuda13x[ctk]` package
+instead of the CUDA 12 package.
+
+Recommended RTX 4000 Ada command:
+
+```powershell
+python "Quantification 3.py" `
+  --prediction-dir prediction `
+  --original-dir "Original Scans" `
+  --device cuda `
+  --cuda-device 0 `
+  --gpu-memory-fraction 0.80 `
+  --analysis-downsample 1 `
+  --overwrite
+```
+
+GPU chunks are selected automatically from the image width and currently free
+VRAM. Override that choice with `--gpu-chunk-rows`; reduce it if another
+process shares the GPU. `--gpu-min-pixels` avoids transfer overhead for small
+arrays. GPU operations use float32 where the existing arrays are float32, but
+probability totals and Euclidean distances retain float64 accumulation/output
+for measurement accuracy. If a CUDA stage fails or runs out of VRAM, it is
+disabled for the remainder of the run, the failure is written to the detailed
+log, and that stage is recalculated on the CPU.
+
+Image decoding, local rank entropy, region-property tables, contour tracing,
+skeletonization, GLCM calculations, and Excel writing remain CPU-bound. A GPU
+therefore will not make every stage faster. Use `--disable-cupy` to retain only
+the PyTorch probability acceleration when diagnosing a CuPy installation.
+
+For SLURM, the included `slurm_quantify.sbatch` requests one GPU and accepts
+paths and settings through environment variables:
+
+```bash
+PREDICTION_DIR=prediction \
+ORIGINAL_DIR="Original Scans" \
+OUTPUT="prediction/Quantification 3.xlsx" \
+sbatch slurm_quantify.sbatch
+```
+
 ## Basic usage
 
 The physical pixel dimensions must come from the acquisition metadata. The
@@ -317,6 +378,12 @@ for the laboratory protocol before treating stain values as concentrations.
 --texture-entropy-radius N    Local-entropy disk radius at analysis scale.
 --max-region-rows N           Workbook region-detail cap.
 --max-pore-rows N             Workbook pore-detail cap.
+--device auto|cpu|cuda        Automatic, CPU-only, or required-CUDA execution.
+--cuda-device N               Zero-based CUDA device index.
+--gpu-memory-fraction X       VRAM fraction targeted by automatic chunking.
+--gpu-chunk-rows N            GPU rows per chunk; 0 selects automatically.
+--gpu-min-pixels N            Minimum array size sent to CUDA.
+--disable-cupy                Keep PyTorch CUDA but use CPU for ndimage filters.
 --log-file PATH               Detailed-log path; default is beside the workbook.
 --console-log-level LEVEL     INFO or DEBUG terminal detail.
 --measurement-log-mode MODE   all, summary, or none measurement logging.

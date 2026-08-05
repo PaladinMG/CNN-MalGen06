@@ -503,6 +503,22 @@ OUTPUT_DIR=/work/results/batch,VENV=/work/project/.venv \
 slurm_predict.sbatch
 ```
 
+Submit GPU-accelerated Quantification 3 after prediction outputs exist:
+
+```bash
+sbatch --export=ALL,\
+PREDICTION_DIR=/work/results/batch,\
+ORIGINAL_DIR=/data/czi,\
+OUTPUT="/work/results/batch/Quantification 3.xlsx",\
+VENV=/work/project/.venv \
+slurm_quantify.sbatch
+```
+
+Install `requirements-gpu.txt` in that environment to enable CuPy acceleration
+for distance transforms, morphology, structure tensors, and Hessian filters.
+Without CuPy, the job still uses PyTorch CUDA for probability reductions and
+logs which remaining stages fall back to the CPU.
+
 Schedule prediction only after training succeeds:
 
 ```bash

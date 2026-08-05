@@ -125,6 +125,19 @@ class AnalysisResults:
     pore_rows_omitted: int = 0
 
 
+@dataclass
+class NativeProbabilityChunkStats:
+    expected_pixels: np.ndarray
+    hard_confidence_sum: np.ndarray
+    hard_confidence_min: np.ndarray
+    hard_confidence_count: np.ndarray
+    low_confidence_count: np.ndarray
+    entropy_sum: float
+    high_entropy_count: int
+    low_margin_count: int
+    bone_fibro_ambiguity_count: int
+
+
 class ConsoleStatusLine:
     def __init__(self) -> None:
         self.stream = sys.stdout
@@ -225,6 +238,18 @@ def package_version(distribution: str) -> str:
         return "not installed"
 
 
+def cupy_package_version() -> str:
+    accelerator = globals().get("ACCELERATOR")
+    loaded_cupy = getattr(accelerator, "cupy", None)
+    if loaded_cupy is not None:
+        return str(getattr(loaded_cupy, "__version__", "unknown"))
+    for distribution in ("cupy-cuda12x", "cupy-cuda13x", "cupy"):
+        version = package_version(distribution)
+        if version != "not installed":
+            return version
+    return "not installed"
+
+
 def format_gib(value: int | None) -> str:
     return "unavailable" if value is None else f"{value / 1024 ** 3:.3f} GiB"
 
@@ -236,6 +261,381 @@ def file_size_or_unavailable(path: Path | None) -> int | str:
         return path.stat().st_size
     except OSError:
         return "unavailable"
+
+
+class AccelerationBackend:
+    """Optional CUDA acceleration with transparent, logged CPU fallbacks."""
+
+    def __init__(self) -> None:
+        self.enabled = False
+        self.requested_device = "cpu"
+        self.resolved_device = "cpu"
+        self.device_index = 0
+        self.device_name = "CPU"
+        self.memory_fraction = 0.80
+        self.configured_chunk_rows = 0
+        self.minimum_pixels = 262_144
+        self.torch = None
+        self.torch_device = None
+        self.cupy = None
+        self.cupy_ndi = None
+        self.disabled_stages: set[str] = set()
+        self.reported_stages: set[str] = set()
+        self.fallback_count = 0
+
+    @property
+    def torch_cuda_available(self) -> bool:
+        return self.torch is not None and self.torch_device is not None
+
+    @property
+    def cupy_available(self) -> bool:
+        return self.cupy is not None and self.cupy_ndi is not None
+
+    def configure(self, args: argparse.Namespace) -> None:
+        self.requested_device = args.device
+        self.device_index = args.cuda_device
+        self.memory_fraction = args.gpu_memory_fraction
+        self.configured_chunk_rows = args.gpu_chunk_rows
+        self.minimum_pixels = args.gpu_min_pixels
+        if args.device == "cpu":
+            self._record_args(args)
+            log("Compute backend | requested=cpu | resolved=cpu")
+            return
+
+        torch_error: Exception | None = None
+        try:
+            import torch
+
+            self.torch = torch
+            if torch.cuda.is_available():
+                device_count = torch.cuda.device_count()
+                if not 0 <= args.cuda_device < device_count:
+                    raise RuntimeError(
+                        f"--cuda-device {args.cuda_device} is invalid; "
+                        f"PyTorch reports {device_count} CUDA device(s)"
+                    )
+                torch.cuda.set_device(args.cuda_device)
+                self.torch_device = torch.device(
+                    "cuda", index=args.cuda_device
+                )
+                self.device_name = torch.cuda.get_device_name(args.cuda_device)
+        except Exception as error:
+            torch_error = error
+            self.torch = None
+            self.torch_device = None
+
+        cupy_error: Exception | None = None
+        if not args.disable_cupy:
+            try:
+                import cupy
+                from cupyx.scipy import ndimage as cupy_ndi
+
+                device_count = int(cupy.cuda.runtime.getDeviceCount())
+                if not 0 <= args.cuda_device < device_count:
+                    raise RuntimeError(
+                        f"--cuda-device {args.cuda_device} is invalid; "
+                        f"CuPy reports {device_count} CUDA device(s)"
+                    )
+                cupy.cuda.Device(args.cuda_device).use()
+                test_value = cupy.asarray([1.0], dtype=cupy.float32)
+                cupy.cuda.get_current_stream().synchronize()
+                del test_value
+                self.cupy = cupy
+                self.cupy_ndi = cupy_ndi
+                try:
+                    cupy.get_default_memory_pool().set_limit(
+                        fraction=args.gpu_memory_fraction
+                    )
+                except (AttributeError, TypeError):
+                    log(
+                        "CuPy memory-pool fraction limit is unavailable in "
+                        "this CuPy version",
+                        logging.DEBUG,
+                    )
+                if self.device_name == "CPU":
+                    properties = cupy.cuda.runtime.getDeviceProperties(
+                        args.cuda_device
+                    )
+                    raw_name = properties.get("name", "CUDA GPU")
+                    self.device_name = (
+                        raw_name.decode(errors="replace")
+                        if isinstance(raw_name, bytes) else str(raw_name)
+                    )
+            except Exception as error:
+                cupy_error = error
+                self.cupy = None
+                self.cupy_ndi = None
+
+        self.enabled = self.torch_cuda_available or self.cupy_available
+        self.resolved_device = (
+            f"cuda:{args.cuda_device}" if self.enabled else "cpu"
+        )
+        if args.device == "cuda" and not self.enabled:
+            details = []
+            if torch_error is not None:
+                details.append(f"PyTorch: {torch_error}")
+            else:
+                details.append("PyTorch was built without usable CUDA support")
+            if args.disable_cupy:
+                details.append("CuPy disabled by --disable-cupy")
+            elif cupy_error is not None:
+                details.append(f"CuPy: {cupy_error}")
+            raise RuntimeError(
+                "CUDA was requested but no CUDA backend could be initialized. "
+                + " | ".join(details)
+            )
+
+        if not self.enabled:
+            log(
+                "Compute backend | "
+                f"requested={args.device} | resolved=cpu | device=CPU"
+            )
+            log(
+                "CUDA is unavailable; using the CPU backend. Add --device cuda "
+                "to require CUDA instead of allowing this fallback.",
+                logging.WARNING,
+            )
+        else:
+            torch_status = (
+                f"enabled ({package_version('torch')}; runtime CUDA "
+                f"{getattr(self.torch.version, 'cuda', 'unknown')})"
+                if self.torch_cuda_available else "unavailable"
+            )
+            cupy_status = (
+                f"enabled ({cupy_package_version()})"
+                if self.cupy_available else "unavailable"
+            )
+            log(
+                "Compute backend | "
+                f"requested={args.device} | resolved={self.resolved_device} | "
+                f"device={self.device_name} | PyTorch CUDA={torch_status} | "
+                f"CuPy ndimage={cupy_status} | "
+                f"memory_fraction={self.memory_fraction:.2f} | "
+                f"gpu_min_pixels={self.minimum_pixels:,}"
+            )
+            if not self.cupy_available and not args.disable_cupy:
+                log(
+                    "CuPy is unavailable: probability reductions can still use "
+                    "PyTorch CUDA, but distance transforms, morphology, and "
+                    "texture filters will remain on the CPU. Install "
+                    "requirements-gpu.txt for the full CUDA path.",
+                    logging.WARNING,
+                )
+                if cupy_error is not None:
+                    log(f"CuPy initialization detail: {cupy_error}", logging.DEBUG)
+        self._record_args(args)
+
+    def _record_args(self, args: argparse.Namespace) -> None:
+        args.resolved_device = self.resolved_device
+        args.cuda_device_name = self.device_name
+        args.pytorch_cuda_enabled = self.torch_cuda_available
+        args.cupy_enabled = self.cupy_available
+
+    def should_use_torch(self, pixel_count: int, stage: str) -> bool:
+        return (
+            self.torch_cuda_available
+            and pixel_count >= self.minimum_pixels
+            and stage not in self.disabled_stages
+        )
+
+    def should_use_cupy(self, pixel_count: int, stage: str) -> bool:
+        return (
+            self.cupy_available
+            and pixel_count >= self.minimum_pixels
+            and stage not in self.disabled_stages
+        )
+
+    def available_gpu_bytes(self) -> int | None:
+        try:
+            if self.cupy_available:
+                free_bytes, _ = self.cupy.cuda.runtime.memGetInfo()
+                return int(free_bytes)
+            if self.torch_cuda_available:
+                free_bytes, _ = self.torch.cuda.mem_get_info(self.device_index)
+                return int(free_bytes)
+        except Exception:
+            return None
+        return None
+
+    def choose_chunk_rows(
+        self,
+        width: int,
+        height: int,
+        bytes_per_pixel: int,
+        halo_rows: int = 0,
+    ) -> int:
+        if self.configured_chunk_rows > 0:
+            return min(height, self.configured_chunk_rows)
+        free_bytes = self.available_gpu_bytes()
+        if free_bytes is None:
+            return min(height, 512)
+        budget = int(free_bytes * min(self.memory_fraction, 0.80) * 0.65)
+        rows = budget // max(1, width * bytes_per_pixel) - 2 * halo_rows
+        return max(1, min(height, 4096, int(rows)))
+
+    def disable_stage(self, stage: str, error: Exception) -> None:
+        self.disabled_stages.add(stage)
+        self.fallback_count += 1
+        log(
+            f"GPU stage fallback | stage={stage} | error={type(error).__name__}: "
+            f"{error} | subsequent work for this stage will use CPU",
+            logging.WARNING,
+        )
+        LOGGER.debug("GPU fallback traceback", exc_info=True)
+        self.release_memory()
+
+    def release_memory(self) -> None:
+        if self.torch_cuda_available:
+            try:
+                self.torch.cuda.empty_cache()
+            except Exception:
+                pass
+        if self.cupy_available:
+            try:
+                self.cupy.get_default_memory_pool().free_all_blocks()
+                self.cupy.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
+
+    def resource_text(self) -> str:
+        if not self.enabled:
+            return "gpu=disabled"
+        parts = [f"gpu={self.resolved_device}"]
+        try:
+            if self.torch_cuda_available:
+                torch = self.torch
+                free_bytes, total_bytes = torch.cuda.mem_get_info(
+                    self.device_index
+                )
+                parts.extend(
+                    [
+                        f"gpu_free={format_gib(int(free_bytes))}",
+                        f"gpu_total={format_gib(int(total_bytes))}",
+                        f"torch_allocated={format_gib(torch.cuda.memory_allocated(self.device_index))}",
+                        f"torch_reserved={format_gib(torch.cuda.memory_reserved(self.device_index))}",
+                    ]
+                )
+            elif self.cupy_available:
+                free_bytes, total_bytes = self.cupy.cuda.runtime.memGetInfo()
+                parts.extend(
+                    [
+                        f"gpu_free={format_gib(int(free_bytes))}",
+                        f"gpu_total={format_gib(int(total_bytes))}",
+                    ]
+                )
+        except Exception as error:
+            parts.append(f"gpu_memory=unavailable({error})")
+        return " | ".join(parts)
+
+    def ndimage(
+        self,
+        operation: str,
+        array: np.ndarray,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        cpu_function = getattr(ndi, operation)
+        stage = f"cupy_{operation}"
+        if not self.should_use_cupy(array.size, stage):
+            return cpu_function(array, *args, **kwargs)
+        cupy = self.cupy
+
+        def to_gpu(value: object) -> object:
+            return cupy.asarray(value) if isinstance(value, np.ndarray) else value
+
+        try:
+            gpu_args = tuple(to_gpu(value) for value in args)
+            gpu_kwargs = {
+                key: to_gpu(value) for key, value in kwargs.items()
+            }
+            gpu_array = cupy.asarray(array)
+            gpu_function = getattr(self.cupy_ndi, operation)
+            if operation == "distance_transform_edt":
+                gpu_kwargs.setdefault("float64_distances", True)
+            try:
+                result = gpu_function(gpu_array, *gpu_args, **gpu_kwargs)
+            except TypeError:
+                if operation != "distance_transform_edt":
+                    raise
+                gpu_kwargs.pop("float64_distances", None)
+                result = gpu_function(gpu_array, *gpu_args, **gpu_kwargs)
+
+            def to_cpu(value: object) -> object:
+                if isinstance(value, cupy.ndarray):
+                    return cupy.asnumpy(value)
+                if isinstance(value, cupy.generic):
+                    return value.item()
+                return value
+
+            if isinstance(result, tuple):
+                cpu_result = tuple(to_cpu(value) for value in result)
+            else:
+                cpu_result = to_cpu(result)
+            if stage not in self.reported_stages:
+                self.reported_stages.add(stage)
+                log(
+                    f"GPU stage active | stage={stage} | "
+                    f"array_shape={array.shape} | array_dtype={array.dtype}",
+                    logging.DEBUG,
+                )
+            return cpu_result
+        except Exception as error:
+            self.disable_stage(stage, error)
+            return cpu_function(array, *args, **kwargs)
+
+
+ACCELERATOR = AccelerationBackend()
+
+
+def accelerated_distance_transform_edt(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> np.ndarray:
+    return ACCELERATOR.ndimage(
+        "distance_transform_edt", array, *args, **kwargs
+    )
+
+
+def accelerated_binary_erosion(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> np.ndarray:
+    return ACCELERATOR.ndimage("binary_erosion", array, *args, **kwargs)
+
+
+def accelerated_binary_dilation(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> np.ndarray:
+    return ACCELERATOR.ndimage("binary_dilation", array, *args, **kwargs)
+
+
+def accelerated_binary_fill_holes(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> np.ndarray:
+    return ACCELERATOR.ndimage("binary_fill_holes", array, *args, **kwargs)
+
+
+def accelerated_label(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> tuple[np.ndarray, int]:
+    labels, count = ACCELERATOR.ndimage("label", array, *args, **kwargs)
+    return labels, int(count)
+
+
+def accelerated_convolve(
+    array: np.ndarray,
+    *args: object,
+    **kwargs: object,
+) -> np.ndarray:
+    return ACCELERATOR.ndimage("convolve", array, *args, **kwargs)
 
 
 def available_memory_bytes() -> int | None:
@@ -307,7 +707,8 @@ def log_resource_snapshot(stage: str, output_path: Path) -> None:
         f"stage={stage} | rss={format_gib(current_memory)} | "
         f"peak_rss={format_gib(peak_memory)} | "
         f"available_ram={format_gib(available_memory)} | "
-        f"output_disk_free={format_gib(disk_free)}",
+        f"output_disk_free={format_gib(disk_free)} | "
+        f"{ACCELERATOR.resource_text()}",
         logging.DEBUG,
     )
 
@@ -323,7 +724,8 @@ def log_startup(args: argparse.Namespace) -> None:
         f"numpy={package_version('numpy')} | Pillow={package_version('Pillow')} | "
         f"scipy={package_version('scipy')} | "
         f"scikit-image={package_version('scikit-image')} | "
-        f"openpyxl={package_version('openpyxl')}"
+        f"openpyxl={package_version('openpyxl')} | "
+        f"torch={package_version('torch')} | cupy={cupy_package_version()}"
     )
     log(f"Command | {' '.join(sys.argv)}", logging.DEBUG)
     for name, value in sorted(vars(args).items()):
@@ -467,6 +869,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--texture-levels", type=int, default=32)
     parser.add_argument("--texture-entropy-radius", type=int, default=5)
     parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help=(
+            "Compute device. 'auto' uses CUDA when available, 'cpu' disables "
+            "GPU work, and 'cuda' fails if no CUDA backend can initialize."
+        ),
+    )
+    parser.add_argument(
+        "--cuda-device",
+        type=int,
+        default=0,
+        help="Zero-based CUDA device index.",
+    )
+    parser.add_argument(
+        "--gpu-memory-fraction",
+        type=float,
+        default=0.80,
+        help=(
+            "Fraction of currently available VRAM targeted by automatic GPU "
+            "chunking and the CuPy memory pool."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-chunk-rows",
+        type=int,
+        default=0,
+        help=(
+            "Rows per GPU chunk. Zero selects a VRAM-aware value automatically."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-min-pixels",
+        type=int,
+        default=262_144,
+        help=(
+            "Minimum array pixels before CUDA is used; avoids transfer overhead "
+            "for small operations."
+        ),
+    )
+    parser.add_argument(
+        "--disable-cupy",
+        action="store_true",
+        help=(
+            "Use only the PyTorch CUDA path; distance transforms, morphology, "
+            "and texture filtering then remain on CPU."
+        ),
+    )
+    parser.add_argument(
         "--max-region-rows",
         type=int,
         default=500_000,
@@ -536,6 +987,14 @@ def parse_args() -> argparse.Namespace:
         parser.error("--texture-levels must be between 4 and 256")
     if args.texture_entropy_radius < 1:
         parser.error("--texture-entropy-radius must be at least 1")
+    if args.cuda_device < 0:
+        parser.error("--cuda-device cannot be negative")
+    if not 0 < args.gpu_memory_fraction <= 1:
+        parser.error("--gpu-memory-fraction must be greater than 0 and at most 1")
+    if args.gpu_chunk_rows < 0:
+        parser.error("--gpu-chunk-rows cannot be negative")
+    if args.gpu_min_pixels < 1:
+        parser.error("--gpu-min-pixels must be at least 1")
     if args.max_region_rows < 0 or args.max_pore_rows < 0:
         parser.error("Detail row limits cannot be negative")
 
@@ -1079,10 +1538,10 @@ def curvature_from_signed_distance(
     pixel_height_um: float,
     pixel_width_um: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    inside = ndi.distance_transform_edt(
+    inside = accelerated_distance_transform_edt(
         mask, sampling=(pixel_height_um, pixel_width_um)
     )
-    outside = ndi.distance_transform_edt(
+    outside = accelerated_distance_transform_edt(
         ~mask, sampling=(pixel_height_um, pixel_width_um)
     )
     signed = outside - inside
@@ -1116,6 +1575,244 @@ def contour_length_um(
             differences[:, 1] * pixel_width_um,
         ).sum()
     return float(total)
+
+
+def cpu_native_probability_chunk_stats(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    args: argparse.Namespace,
+) -> NativeProbabilityChunkStats:
+    class_count = len(CLASS_NAMES)
+    expected_pixels = probabilities.sum(axis=(1, 2), dtype=np.float64)
+    hard_confidence_sum = np.zeros(class_count, dtype=np.float64)
+    hard_confidence_min = np.full(class_count, np.inf, dtype=np.float64)
+    hard_confidence_count = np.zeros(class_count, dtype=np.int64)
+    low_confidence_count = np.zeros(class_count, dtype=np.int64)
+    for class_id in range(class_count):
+        selected = probabilities[class_id][labels == class_id]
+        if selected.size:
+            hard_confidence_sum[class_id] = selected.sum(dtype=np.float64)
+            hard_confidence_count[class_id] = selected.size
+            hard_confidence_min[class_id] = float(selected.min())
+            low_confidence_count[class_id] = np.count_nonzero(
+                selected < args.low_confidence_threshold
+            )
+
+    sums = probabilities.sum(axis=0, keepdims=True)
+    normalized = probabilities / np.maximum(sums, EPSILON)
+    entropy = -np.sum(
+        normalized * np.log(np.maximum(normalized, EPSILON)), axis=0
+    ) / math.log(class_count)
+    two_largest = np.partition(normalized, -2, axis=0)[-2:]
+    margin = two_largest[1] - two_largest[0]
+    # A strict comparison against every other class gives deterministic CPU/GPU
+    # behavior when probability values tie. It also avoids a large integer
+    # argpartition array for whole-slide chunks.
+    bone_fibro_pair = np.minimum(
+        normalized[0], normalized[1]
+    ) > np.max(normalized[2:], axis=0)
+    return NativeProbabilityChunkStats(
+        expected_pixels=expected_pixels,
+        hard_confidence_sum=hard_confidence_sum,
+        hard_confidence_min=hard_confidence_min,
+        hard_confidence_count=hard_confidence_count,
+        low_confidence_count=low_confidence_count,
+        entropy_sum=float(entropy.sum(dtype=np.float64)),
+        high_entropy_count=int(
+            np.count_nonzero(entropy >= args.high_entropy_threshold)
+        ),
+        low_margin_count=int(
+            np.count_nonzero(margin <= args.uncertainty_margin)
+        ),
+        bone_fibro_ambiguity_count=int(
+            np.count_nonzero(
+                bone_fibro_pair & (margin <= args.uncertainty_margin)
+            )
+        ),
+    )
+
+
+def torch_native_probability_chunk_stats(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    args: argparse.Namespace,
+) -> NativeProbabilityChunkStats | None:
+    stage = "torch_probability_statistics"
+    pixel_count = labels.size
+    if not ACCELERATOR.should_use_torch(pixel_count, stage):
+        return None
+    torch = ACCELERATOR.torch
+    try:
+        with torch.inference_mode():
+            probability_tensor = torch.as_tensor(
+                np.ascontiguousarray(probabilities),
+                device=ACCELERATOR.torch_device,
+                dtype=torch.float32,
+            )
+            label_tensor = torch.as_tensor(
+                np.ascontiguousarray(labels),
+                device=ACCELERATOR.torch_device,
+                dtype=torch.long,
+            )
+            class_count = len(CLASS_NAMES)
+            expected_pixels = probability_tensor.sum(
+                dim=(1, 2), dtype=torch.float64
+            )
+            hard_values = probability_tensor.gather(
+                0, label_tensor.unsqueeze(0)
+            ).squeeze(0)
+            flat_labels = label_tensor.reshape(-1)
+            flat_values = hard_values.reshape(-1)
+            hard_confidence_count = torch.bincount(
+                flat_labels, minlength=class_count
+            )
+            hard_confidence_sum = torch.bincount(
+                flat_labels,
+                weights=flat_values.to(torch.float64),
+                minlength=class_count,
+            )
+            low_confidence_count = torch.bincount(
+                flat_labels,
+                weights=(
+                    flat_values < args.low_confidence_threshold
+                ).to(torch.float64),
+                minlength=class_count,
+            )
+            hard_confidence_min = torch.full(
+                (class_count,),
+                float("inf"),
+                dtype=torch.float64,
+                device=ACCELERATOR.torch_device,
+            )
+            for class_id in range(class_count):
+                selected = flat_values[flat_labels == class_id]
+                if selected.numel():
+                    hard_confidence_min[class_id] = selected.min().to(
+                        torch.float64
+                    )
+
+            normalized = probability_tensor / probability_tensor.sum(
+                dim=0, keepdim=True
+            ).clamp_min(EPSILON)
+            entropy = -(
+                normalized
+                * normalized.clamp_min(EPSILON).log()
+            ).sum(dim=0) / math.log(class_count)
+            top_values = torch.topk(
+                normalized, k=2, dim=0, largest=True, sorted=True
+            ).values
+            margin = top_values[0] - top_values[1]
+            low_margin = margin <= args.uncertainty_margin
+            bone_fibro_pair = torch.minimum(
+                normalized[0], normalized[1]
+            ) > normalized[2:].amax(dim=0)
+            result = NativeProbabilityChunkStats(
+                expected_pixels=expected_pixels.cpu().numpy(),
+                hard_confidence_sum=hard_confidence_sum.cpu().numpy(),
+                hard_confidence_min=hard_confidence_min.cpu().numpy(),
+                hard_confidence_count=hard_confidence_count.cpu().numpy(),
+                low_confidence_count=np.rint(
+                    low_confidence_count.cpu().numpy()
+                ).astype(np.int64),
+                entropy_sum=float(
+                    entropy.sum(dtype=torch.float64).item()
+                ),
+                high_entropy_count=int(
+                    (entropy >= args.high_entropy_threshold).sum().item()
+                ),
+                low_margin_count=int(low_margin.sum().item()),
+                bone_fibro_ambiguity_count=int(
+                    (bone_fibro_pair & low_margin).sum().item()
+                ),
+            )
+            del (
+                probability_tensor,
+                label_tensor,
+                hard_values,
+                normalized,
+                entropy,
+                top_values,
+            )
+            if stage not in ACCELERATOR.reported_stages:
+                ACCELERATOR.reported_stages.add(stage)
+                log(
+                    f"GPU stage active | stage={stage} | "
+                    f"chunk_shape={probabilities.shape}",
+                    logging.DEBUG,
+                )
+            return result
+    except Exception as error:
+        ACCELERATOR.disable_stage(stage, error)
+        return None
+
+
+def native_probability_chunk_stats(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    args: argparse.Namespace,
+) -> NativeProbabilityChunkStats:
+    gpu_result = torch_native_probability_chunk_stats(
+        probabilities, labels, args
+    )
+    if gpu_result is not None:
+        return gpu_result
+    return cpu_native_probability_chunk_stats(probabilities, labels, args)
+
+
+def cpu_uncertainty_chunk(
+    probabilities: np.ndarray,
+    uncertainty_margin: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    normalized = probabilities / np.maximum(
+        probabilities.sum(axis=0, keepdims=True), EPSILON
+    )
+    two_largest = np.partition(normalized, -2, axis=0)[-2:]
+    margin = two_largest[1] - two_largest[0]
+    uncertain = margin <= uncertainty_margin
+    pair = np.minimum(normalized[0], normalized[1]) > np.max(
+        normalized[2:], axis=0
+    )
+    return uncertain, pair & uncertain
+
+
+def uncertainty_chunk(
+    probabilities: np.ndarray,
+    uncertainty_margin: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    stage = "torch_analysis_uncertainty"
+    pixel_count = probabilities.shape[1] * probabilities.shape[2]
+    if ACCELERATOR.should_use_torch(pixel_count, stage):
+        torch = ACCELERATOR.torch
+        try:
+            with torch.inference_mode():
+                tensor = torch.as_tensor(
+                    np.ascontiguousarray(probabilities),
+                    device=ACCELERATOR.torch_device,
+                    dtype=torch.float32,
+                )
+                normalized = tensor / tensor.sum(
+                    dim=0, keepdim=True
+                ).clamp_min(EPSILON)
+                values = torch.topk(
+                    normalized, k=2, dim=0, largest=True, sorted=True
+                ).values
+                uncertain = values[0] - values[1] <= uncertainty_margin
+                pair = torch.minimum(
+                    normalized[0], normalized[1]
+                ) > normalized[2:].amax(dim=0)
+                uncertain_cpu = uncertain.cpu().numpy()
+                pair_cpu = (pair & uncertain).cpu().numpy()
+                if stage not in ACCELERATOR.reported_stages:
+                    ACCELERATOR.reported_stages.add(stage)
+                    log(
+                        f"GPU stage active | stage={stage} | "
+                        f"chunk_shape={probabilities.shape}",
+                        logging.DEBUG,
+                    )
+                return uncertain_cpu, pair_cpu
+        except Exception as error:
+            ACCELERATOR.disable_stage(stage, error)
+    return cpu_uncertainty_chunk(probabilities, uncertainty_margin)
 
 
 def probability_statistics(
@@ -1173,13 +1870,23 @@ def probability_statistics(
     low_margin_count = 0
     bone_fibro_ambiguity_count = 0
     total_pixels = height * width
-    native_chunk_count = math.ceil(height / args.chunk_rows)
+    native_chunk_rows = args.chunk_rows
+    if ACCELERATOR.torch_cuda_available:
+        native_chunk_rows = ACCELERATOR.choose_chunk_rows(
+            width, height, bytes_per_pixel=96
+        )
+        log(
+            f"{source.scan.name}: CUDA probability chunk rows="
+            f"{native_chunk_rows:,}",
+            logging.DEBUG,
+        )
+    native_chunk_count = math.ceil(height / native_chunk_rows)
 
     with Image.open(label_path) as label_image:
         label_remap = palette_class_remap(label_image, label_path)
-        for top in range(0, height, args.chunk_rows):
-            bottom = min(top + args.chunk_rows, height)
-            chunk_index = top // args.chunk_rows + 1
+        for top in range(0, height, native_chunk_rows):
+            bottom = min(top + native_chunk_rows, height)
+            chunk_index = top // native_chunk_rows + 1
             if (
                 chunk_index == 1
                 or chunk_index == native_chunk_count
@@ -1196,49 +1903,36 @@ def probability_statistics(
             labels = decode_label_array(
                 raw_labels, label_remap, label_path
             )
-            expected_pixels += probabilities.sum(axis=(1, 2), dtype=np.float64)
-            for class_id in range(len(CLASS_NAMES)):
-                selected = probabilities[class_id][labels == class_id]
-                if selected.size:
-                    hard_confidence_sum[class_id] += selected.sum(dtype=np.float64)
-                    hard_confidence_count[class_id] += selected.size
-                    hard_confidence_min[class_id] = min(
-                        hard_confidence_min[class_id], float(selected.min())
-                    )
-                    low_confidence_count[class_id] += np.count_nonzero(
-                        selected < args.low_confidence_threshold
-                    )
-
-            sums = probabilities.sum(axis=0, keepdims=True)
-            normalized = probabilities / np.maximum(sums, EPSILON)
-            entropy = -np.sum(
-                normalized * np.log(np.maximum(normalized, EPSILON)), axis=0
-            ) / math.log(len(CLASS_NAMES))
-            entropy_sum += entropy.sum(dtype=np.float64)
-            high_entropy_count += np.count_nonzero(
-                entropy >= args.high_entropy_threshold
+            chunk_stats = native_probability_chunk_stats(
+                probabilities, labels, args
             )
-            two_largest = np.partition(normalized, -2, axis=0)[-2:]
-            margin = two_largest[1] - two_largest[0]
-            low_margin_count += np.count_nonzero(
-                margin <= args.uncertainty_margin
+            expected_pixels += chunk_stats.expected_pixels
+            hard_confidence_sum += chunk_stats.hard_confidence_sum
+            hard_confidence_min = np.minimum(
+                hard_confidence_min, chunk_stats.hard_confidence_min
             )
-            top_two_ids = np.argpartition(normalized, -2, axis=0)[-2:]
-            bone_fibro_pair = (
-                (top_two_ids[0] == 0) & (top_two_ids[1] == 1)
-            ) | ((top_two_ids[0] == 1) & (top_two_ids[1] == 0))
-            bone_fibro_ambiguity_count += np.count_nonzero(
-                bone_fibro_pair & (margin <= args.uncertainty_margin)
+            hard_confidence_count += chunk_stats.hard_confidence_count
+            low_confidence_count += chunk_stats.low_confidence_count
+            entropy_sum += chunk_stats.entropy_sum
+            high_entropy_count += chunk_stats.high_entropy_count
+            low_margin_count += chunk_stats.low_margin_count
+            bone_fibro_ambiguity_count += (
+                chunk_stats.bone_fibro_ambiguity_count
             )
-            del probabilities, normalized, entropy, two_largest, top_two_ids
+            del probabilities, labels, chunk_stats
 
     analysis_height, analysis_width = labels_analysis.shape
     uncertain_mask = np.zeros(labels_analysis.shape, dtype=bool)
     bone_fibro_mask = np.zeros(labels_analysis.shape, dtype=bool)
-    analysis_chunk_count = math.ceil(analysis_height / args.chunk_rows)
-    for top in range(0, analysis_height, args.chunk_rows):
-        bottom = min(top + args.chunk_rows, analysis_height)
-        chunk_index = top // args.chunk_rows + 1
+    analysis_chunk_rows = args.chunk_rows
+    if ACCELERATOR.torch_cuda_available:
+        analysis_chunk_rows = ACCELERATOR.choose_chunk_rows(
+            analysis_width, analysis_height, bytes_per_pixel=72
+        )
+    analysis_chunk_count = math.ceil(analysis_height / analysis_chunk_rows)
+    for top in range(0, analysis_height, analysis_chunk_rows):
+        bottom = min(top + analysis_chunk_rows, analysis_height)
+        chunk_index = top // analysis_chunk_rows + 1
         if (
             chunk_index == 1
             or chunk_index == analysis_chunk_count
@@ -1255,20 +1949,12 @@ def probability_statistics(
             0.0,
             1.0,
         )
-        normalized = probabilities / np.maximum(
-            probabilities.sum(axis=0, keepdims=True), EPSILON
+        uncertain_chunk, bone_fibro_chunk = uncertainty_chunk(
+            probabilities, args.uncertainty_margin
         )
-        two_largest = np.partition(normalized, -2, axis=0)[-2:]
-        margin = two_largest[1] - two_largest[0]
-        uncertain_mask[top:bottom] = margin <= args.uncertainty_margin
-        top_two_ids = np.argpartition(normalized, -2, axis=0)[-2:]
-        pair = ((top_two_ids[0] == 0) & (top_two_ids[1] == 1)) | (
-            (top_two_ids[0] == 1) & (top_two_ids[1] == 0)
-        )
-        bone_fibro_mask[top:bottom] = pair & (
-            margin <= args.uncertainty_margin
-        )
-        del probabilities, normalized, two_largest, top_two_ids
+        uncertain_mask[top:bottom] = uncertain_chunk
+        bone_fibro_mask[top:bottom] = bone_fibro_chunk
+        del probabilities, uncertain_chunk, bone_fibro_chunk
 
     class_rows = []
     for class_id in range(len(CLASS_NAMES)):
@@ -1312,6 +1998,9 @@ def probability_statistics(
         f"{scan_metrics['Bone-Fibrocartilage ambiguity fraction']:.6f} | "
         f"elapsed_seconds={time.perf_counter() - started:.3f}"
     )
+    # Probability chunks use the PyTorch caching allocator. Return those
+    # cached blocks before CuPy begins morphology and distance-transform work.
+    ACCELERATOR.release_memory()
     return (
         scan_metrics,
         class_rows,
@@ -1337,7 +2026,7 @@ def component_measurements(
     list[measure._regionprops.RegionProperties],
     int,
 ]:
-    component_labels, component_count = ndi.label(
+    component_labels, component_count = accelerated_label(
         mask, structure=np.ones((3, 3), dtype=np.uint8)
     )
     properties = measure.regionprops(component_labels)
@@ -1413,7 +2102,7 @@ def component_measurements(
         region_curvature = None
         if curvature is not None:
             local_curvature = curvature[prop.slice]
-            region_boundary = local_mask & ~ndi.binary_erosion(local_mask)
+            region_boundary = local_mask & ~accelerated_binary_erosion(local_mask)
             values = np.abs(local_curvature[region_boundary])
             if values.size:
                 region_curvature = float(np.mean(values))
@@ -1573,9 +2262,9 @@ def pore_measurements(
     pixel_width_um: float,
     detail_limit: int,
 ) -> tuple[dict[str, object], list[dict[str, object]], np.ndarray, int]:
-    filled = ndi.binary_fill_holes(mask)
+    filled = accelerated_binary_fill_holes(mask)
     pores = filled & ~mask
-    pore_labels, pore_count = ndi.label(
+    pore_labels, pore_count = accelerated_label(
         pores, structure=np.ones((3, 3), dtype=np.uint8)
     )
     properties = measure.regionprops(pore_labels)
@@ -1681,7 +2370,7 @@ def skeleton_measurements(
     length_um = physical_skeleton_length(
         skeleton, pixel_height_um, pixel_width_um
     )
-    neighbor_count = ndi.convolve(
+    neighbor_count = accelerated_convolve(
         skeleton.astype(np.uint8),
         np.ones((3, 3), dtype=np.uint8),
         mode="constant",
@@ -1689,11 +2378,11 @@ def skeleton_measurements(
     ) - skeleton.astype(np.uint8)
     endpoint_count = int(np.count_nonzero(skeleton & (neighbor_count == 1)))
     junction_pixels = skeleton & (neighbor_count >= 3)
-    _, junction_count = ndi.label(
+    _, junction_count = accelerated_label(
         junction_pixels, structure=np.ones((3, 3), dtype=np.uint8)
     )
     if inside_distance is None:
-        inside_distance = ndi.distance_transform_edt(
+        inside_distance = accelerated_distance_transform_edt(
             mask, sampling=(pixel_height_um, pixel_width_um)
         )
     thickness = 2.0 * inside_distance[skeleton]
@@ -1779,19 +2468,19 @@ def analyze_classes(
             update_status(f"{scan.name} | {class_name} | curvature and distances")
             if args.skip_curvature:
                 if not args.skip_skeleton:
-                    inside_distance = ndi.distance_transform_edt(
+                    inside_distance = accelerated_distance_transform_edt(
                         mask, sampling=(pixel_height_um, pixel_width_um)
                     )
             else:
                 curvature, inside_distance = curvature_from_signed_distance(
                     mask, pixel_height_um, pixel_width_um
                 )
-                class_boundary = mask & ~ndi.binary_erosion(mask)
+                class_boundary = mask & ~accelerated_binary_erosion(mask)
                 for target_id in range(len(CLASS_NAMES)):
                     if target_id == class_id:
                         continue
                     target = labels == target_id
-                    interface_side = class_boundary & ndi.binary_dilation(target)
+                    interface_side = class_boundary & accelerated_binary_dilation(target)
                     values = np.abs(curvature[interface_side])
                     interface_curvature[(class_id, target_id)] = (
                         float(values.mean()) if values.size else None
@@ -2003,7 +2692,7 @@ def pair_contact_measurements(
             pair_boundary[:, 1:] |= horizontal
             pair_boundary[:-1, :] |= vertical
             pair_boundary[1:, :] |= vertical
-            _, segment_count = ndi.label(
+            _, segment_count = accelerated_label(
                 pair_boundary, structure=np.ones((3, 3), dtype=np.uint8)
             )
             coordinates = np.argwhere(pair_boundary)
@@ -2086,7 +2775,7 @@ def spatial_measurements(
     for target_id, target_name in enumerate(CLASS_NAMES):
         target_mask = labels == target_id
         if np.any(target_mask):
-            distance = ndi.distance_transform_edt(
+            distance = accelerated_distance_transform_edt(
                 ~target_mask, sampling=(pixel_height_um, pixel_width_um)
             )
         else:
@@ -2157,7 +2846,7 @@ def distance_bands_from_bone(
     bone_mask = labels == 0
     if not np.any(bone_mask):
         return []
-    distance = ndi.distance_transform_edt(
+    distance = accelerated_distance_transform_edt(
         ~bone_mask, sampling=(pixel_height_um, pixel_width_um)
     )
     band_ids = np.floor(distance / band_size_um).astype(np.int32)
@@ -2402,6 +3091,192 @@ def masked_glcm_metrics(
     }
 
 
+def cuda_dense_texture_features(
+    scan_name: str,
+    gray_float: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Calculate dense derivative features with tiled CuPy ndimage filters."""
+    stage = "cupy_dense_texture"
+    height, width = gray_float.shape
+    if not ACCELERATOR.should_use_cupy(gray_float.size, stage):
+        return None
+    cupy = ACCELERATOR.cupy
+    cupy_ndi = ACCELERATOR.cupy_ndi
+    # The Hessian uses two sigma/sqrt(2) Gaussian-derivative passes with a
+    # truncate of 100. Each pass has a 71-pixel radius at sigma=1, so 144 rows
+    # of overlap safely preserve values at internal tile edges.
+    halo_rows = 144
+    chunk_rows = ACCELERATOR.choose_chunk_rows(
+        width,
+        height,
+        bytes_per_pixel=96,
+        halo_rows=halo_rows,
+    )
+    gradient_magnitude = np.empty_like(gray_float, dtype=np.float32)
+    tensor_coherence = np.empty_like(gray_float, dtype=np.float32)
+    tensor_orientation = np.empty_like(gray_float, dtype=np.float32)
+    ridge_strength = np.empty_like(gray_float, dtype=np.float32)
+    chunk_count = math.ceil(height / chunk_rows)
+    log(
+        f"{scan_name}: CuPy dense texture filters | chunk_rows={chunk_rows:,} | "
+        f"halo_rows={halo_rows} | chunks={chunk_count:,}",
+        logging.DEBUG,
+    )
+    try:
+        for top in range(0, height, chunk_rows):
+            bottom = min(top + chunk_rows, height)
+            chunk_index = top // chunk_rows + 1
+            read_top = max(0, top - halo_rows)
+            read_bottom = min(height, bottom + halo_rows)
+            local_top = top - read_top
+            local_bottom = local_top + bottom - top
+            update_status(
+                f"{scan_name} | CUDA texture filters | "
+                f"chunk {chunk_index}/{chunk_count}"
+            )
+            gpu_gray = cupy.asarray(
+                np.ascontiguousarray(gray_float[read_top:read_bottom]),
+                dtype=cupy.float32,
+            )
+
+            gradient_y = cupy_ndi.sobel(
+                gpu_gray, axis=0, mode="reflect"
+            ) / cupy.float32(8.0)
+            gradient_x = cupy_ndi.sobel(
+                gpu_gray, axis=1, mode="reflect"
+            ) / cupy.float32(8.0)
+            gpu_gradient_magnitude = cupy.hypot(
+                gradient_y, gradient_x
+            ).astype(cupy.float32, copy=False)
+
+            derivative_r = cupy_ndi.sobel(
+                gpu_gray, axis=0, mode="constant", cval=0
+            )
+            derivative_c = cupy_ndi.sobel(
+                gpu_gray, axis=1, mode="constant", cval=0
+            )
+            tensor_rr = cupy_ndi.gaussian_filter(
+                derivative_r * derivative_r,
+                sigma=1.0,
+                mode="constant",
+                cval=0,
+            )
+            tensor_rc = cupy_ndi.gaussian_filter(
+                derivative_r * derivative_c,
+                sigma=1.0,
+                mode="constant",
+                cval=0,
+            )
+            tensor_cc = cupy_ndi.gaussian_filter(
+                derivative_c * derivative_c,
+                sigma=1.0,
+                mode="constant",
+                cval=0,
+            )
+            tensor_delta = cupy.sqrt(
+                (tensor_rr - tensor_cc) ** 2
+                + cupy.float32(4.0) * tensor_rc ** 2
+            )
+            gpu_tensor_coherence = tensor_delta / cupy.maximum(
+                tensor_rr + tensor_cc, cupy.float32(EPSILON)
+            )
+            gpu_tensor_orientation = cupy.float32(0.5) * cupy.arctan2(
+                cupy.float32(2.0) * tensor_rc,
+                tensor_rr - tensor_cc,
+            )
+
+            sigma_scaled = (1.0 / math.sqrt(2.0),) * 2
+            gaussian_kwargs = {
+                "sigma": sigma_scaled,
+                "mode": "constant",
+                "cval": 0,
+                "truncate": 100,
+            }
+            hessian_gradient_r = cupy_ndi.gaussian_filter(
+                gpu_gray, order=(1, 0), **gaussian_kwargs
+            )
+            hessian_gradient_c = cupy_ndi.gaussian_filter(
+                gpu_gray, order=(0, 1), **gaussian_kwargs
+            )
+            hessian_rr = cupy_ndi.gaussian_filter(
+                hessian_gradient_r, order=(1, 0), **gaussian_kwargs
+            )
+            hessian_rc = cupy_ndi.gaussian_filter(
+                hessian_gradient_r, order=(0, 1), **gaussian_kwargs
+            )
+            hessian_cc = cupy_ndi.gaussian_filter(
+                hessian_gradient_c, order=(0, 1), **gaussian_kwargs
+            )
+            hessian_half_delta = cupy.sqrt(
+                hessian_rc ** 2
+                + ((hessian_rr - hessian_cc) / cupy.float32(2.0)) ** 2
+            )
+            hessian_minimum = (
+                (hessian_rr + hessian_cc) / cupy.float32(2.0)
+                - hessian_half_delta
+            )
+            gpu_ridge_strength = cupy.maximum(
+                cupy.float32(0.0), -hessian_minimum
+            ).astype(cupy.float32, copy=False)
+
+            target_slice = slice(top, bottom)
+            local_slice = slice(local_top, local_bottom)
+            gradient_magnitude[target_slice] = cupy.asnumpy(
+                gpu_gradient_magnitude[local_slice]
+            )
+            tensor_coherence[target_slice] = cupy.asnumpy(
+                gpu_tensor_coherence[local_slice]
+            )
+            tensor_orientation[target_slice] = cupy.asnumpy(
+                gpu_tensor_orientation[local_slice]
+            )
+            ridge_strength[target_slice] = cupy.asnumpy(
+                gpu_ridge_strength[local_slice]
+            )
+            del (
+                gpu_gray,
+                gradient_y,
+                gradient_x,
+                gpu_gradient_magnitude,
+                derivative_r,
+                derivative_c,
+                tensor_rr,
+                tensor_rc,
+                tensor_cc,
+                tensor_delta,
+                gpu_tensor_coherence,
+                gpu_tensor_orientation,
+                hessian_gradient_r,
+                hessian_gradient_c,
+                hessian_rr,
+                hessian_rc,
+                hessian_cc,
+                hessian_half_delta,
+                hessian_minimum,
+                gpu_ridge_strength,
+            )
+        log(
+            f"{scan_name}: CuPy dense texture filters complete | "
+            f"chunks={chunk_count:,}",
+            logging.DEBUG,
+        )
+        return (
+            gradient_magnitude,
+            tensor_coherence,
+            tensor_orientation,
+            ridge_strength,
+        )
+    except Exception as error:
+        ACCELERATOR.disable_stage(stage, error)
+        del (
+            gradient_magnitude,
+            tensor_coherence,
+            tensor_orientation,
+            ridge_strength,
+        )
+        return None
+
+
 def texture_measurements(
     scan_name: str,
     labels: np.ndarray,
@@ -2428,48 +3303,67 @@ def texture_measurements(
         + 0.0722 * rgb[..., 2]
     ).astype(np.uint8)
     gray_float = gray.astype(np.float32) / np.float32(255.0)
-    gradient_y = ndi.sobel(gray_float, axis=0, mode="reflect") / 8.0
-    gradient_x = ndi.sobel(gray_float, axis=1, mode="reflect") / 8.0
-    gradient_magnitude = np.hypot(gradient_y, gradient_x).astype(np.float32)
+    update_status(f"{scan_name} | texture | local entropy")
     local_entropy = filters.rank.entropy(
         gray, morphology.disk(args.texture_entropy_radius)
     ).astype(np.float32)
 
-    update_status(f"{scan_name} | texture | structure tensor")
-    tensor_rr, tensor_rc, tensor_cc = feature.structure_tensor(
-        gray_float, sigma=1.0, order="rc"
-    )
-    tensor_delta = np.sqrt(
-        (tensor_rr - tensor_cc) ** 2 + 4.0 * tensor_rc ** 2
-    )
-    tensor_coherence = tensor_delta / np.maximum(
-        tensor_rr + tensor_cc, EPSILON
-    )
-    tensor_orientation = 0.5 * np.arctan2(
-        2.0 * tensor_rc, tensor_rr - tensor_cc
-    )
-    del tensor_rr, tensor_rc, tensor_cc, tensor_delta
+    dense_features = cuda_dense_texture_features(scan_name, gray_float)
+    if dense_features is not None:
+        (
+            gradient_magnitude,
+            tensor_coherence,
+            tensor_orientation,
+            ridge_strength,
+        ) = dense_features
+        log(
+            f"{scan_name}: gradient, structure-tensor, and Hessian arrays "
+            "calculated with CuPy CUDA",
+            logging.DEBUG,
+        )
+    else:
+        update_status(f"{scan_name} | texture | CPU Sobel gradients")
+        gradient_y = ndi.sobel(gray_float, axis=0, mode="reflect") / 8.0
+        gradient_x = ndi.sobel(gray_float, axis=1, mode="reflect") / 8.0
+        gradient_magnitude = np.hypot(
+            gradient_y, gradient_x
+        ).astype(np.float32)
 
-    update_status(f"{scan_name} | texture | Hessian ridge response")
-    hessian_elements = feature.hessian_matrix(
-        gray_float,
-        sigma=1.0,
-        order="rc",
-        use_gaussian_derivatives=True,
-    )
-    hessian_eigenvalues = feature.hessian_matrix_eigvals(hessian_elements)
-    ridge_strength = np.maximum(
-        0.0, -np.minimum(hessian_eigenvalues[0], hessian_eigenvalues[1])
-    ).astype(np.float32)
-    del hessian_elements, hessian_eigenvalues
+        update_status(f"{scan_name} | texture | CPU structure tensor")
+        tensor_rr, tensor_rc, tensor_cc = feature.structure_tensor(
+            gray_float, sigma=1.0, order="rc"
+        )
+        tensor_delta = np.sqrt(
+            (tensor_rr - tensor_cc) ** 2 + 4.0 * tensor_rc ** 2
+        )
+        tensor_coherence = tensor_delta / np.maximum(
+            tensor_rr + tensor_cc, EPSILON
+        )
+        tensor_orientation = 0.5 * np.arctan2(
+            2.0 * tensor_rc, tensor_rr - tensor_cc
+        )
+        del tensor_rr, tensor_rc, tensor_cc, tensor_delta
+
+        update_status(f"{scan_name} | texture | CPU Hessian ridge response")
+        hessian_elements = feature.hessian_matrix(
+            gray_float,
+            sigma=1.0,
+            order="rc",
+            use_gaussian_derivatives=True,
+        )
+        hessian_eigenvalues = feature.hessian_matrix_eigvals(hessian_elements)
+        ridge_strength = np.maximum(
+            0.0, -np.minimum(hessian_eigenvalues[0], hessian_eigenvalues[1])
+        ).astype(np.float32)
+        del hessian_elements, hessian_eigenvalues
 
     rows = []
-    retained_regions: dict[str, dict[int, dict[str, object]]] = defaultdict(dict)
+    retained_regions: dict[str, list[dict[str, object]]] = defaultdict(list)
     for region_row in region_rows:
         if region_row.get("Scan") == scan_name:
-            retained_regions[str(region_row["Class"])][
-                int(region_row["Region ID"])
-            ] = region_row
+            retained_regions[str(region_row["Class"])].append(region_row)
+    pixel_height_um = args.pixel_height_um * args.analysis_downsample
+    pixel_width_um = args.pixel_width_um * args.analysis_downsample
     for class_id, class_name in enumerate(CLASS_NAMES):
         update_status(f"{scan_name} | texture | {class_name}")
         mask = labels == class_id
@@ -2547,18 +3441,43 @@ def texture_measurements(
             logging.DEBUG,
         )
 
-        retained = retained_regions.get(class_name, {})
+        retained = retained_regions.get(class_name, [])
         if retained:
-            component_labels, _ = ndi.label(
+            component_labels, _ = accelerated_label(
                 mask, structure=np.ones((3, 3), dtype=np.uint8)
             )
-            object_slices = ndi.find_objects(component_labels)
-            for region_id, region_row in retained.items():
-                if region_id < 1 or region_id > len(object_slices):
-                    continue
-                region_slice = object_slices[region_id - 1]
-                if region_slice is None:
-                    continue
+            component_properties = measure.regionprops(component_labels)
+            properties_by_centroid = {
+                (
+                    round(float(prop.centroid[0]), 8),
+                    round(float(prop.centroid[1]), 8),
+                ): prop
+                for prop in component_properties
+            }
+            for region_row in retained:
+                target_centroid = (
+                    float(region_row["Centroid Y (µm)"]) / pixel_height_um,
+                    float(region_row["Centroid X (µm)"]) / pixel_width_um,
+                )
+                prop = properties_by_centroid.get(
+                    (
+                        round(target_centroid[0], 8),
+                        round(target_centroid[1], 8),
+                    )
+                )
+                if prop is None:
+                    # GPU connected-component numbering is not required to
+                    # match SciPy numbering. Centroids provide a stable
+                    # cross-backend identity for retained regions.
+                    prop = min(
+                        component_properties,
+                        key=lambda candidate: (
+                            (candidate.centroid[0] - target_centroid[0]) ** 2
+                            + (candidate.centroid[1] - target_centroid[1]) ** 2
+                        ),
+                    )
+                region_id = int(prop.label)
+                region_slice = prop.slice
                 local_mask = component_labels[region_slice] == region_id
                 local_rgb = rgb[region_slice][local_mask].astype(np.float32) / 255.0
                 local_gray = gray[region_slice][local_mask]
@@ -2605,7 +3524,7 @@ def texture_measurements(
                         ),
                     }
                 )
-            del component_labels
+            del component_labels, component_properties, properties_by_centroid
         del selected_rgb, optical_density, hed
     log(
         f"{scan_name}: texture measurements complete | "
@@ -3375,6 +4294,15 @@ def write_readme_sheet(
         ("Pixel width (µm)", args.pixel_width_um),
         ("Pixel height (µm)", args.pixel_height_um),
         ("Analysis downsample", args.analysis_downsample),
+        ("Requested compute device", args.device),
+        ("Resolved compute device", args.resolved_device),
+        ("CUDA device", args.cuda_device_name),
+        ("PyTorch CUDA enabled", args.pytorch_cuda_enabled),
+        ("CuPy ndimage enabled", args.cupy_enabled),
+        ("GPU memory fraction", args.gpu_memory_fraction),
+        ("GPU chunk rows", args.gpu_chunk_rows or "Automatic"),
+        ("GPU minimum pixels", args.gpu_min_pixels),
+        ("GPU fallback count", ACCELERATOR.fallback_count),
         ("Low-confidence threshold", args.low_confidence_threshold),
         ("Uncertainty margin", args.uncertainty_margin),
         ("High normalized-entropy threshold", args.high_entropy_threshold),
@@ -3519,8 +4447,9 @@ def main() -> None:
     args = parse_args()
     configure_logging(args)
     process_started = time.perf_counter()
-    log_startup(args)
     try:
+        ACCELERATOR.configure(args)
+        log_startup(args)
         log("Step 1/5: discovering scans and optional inputs")
         scans = discover_scans(args.prediction_dir, args.original_dir)
         log(f"Discovered {len(scans)} scan(s)")
@@ -3538,6 +4467,7 @@ def main() -> None:
             )
             scan_results = analyze_scan(scan, index, len(scans), scan_args)
             extend_results(combined, scan_results)
+            ACCELERATOR.release_memory()
         log("Step 3/5: recording every measurement in the detailed log")
         log_all_measurements(combined, args.measurement_log_mode)
         log_resource_snapshot("before_workbook", args.output)
@@ -3549,10 +4479,12 @@ def main() -> None:
         log(
             f"Saved and verified: {args.output.resolve()} | "
             f"elapsed_seconds={time.perf_counter() - process_started:.3f} | "
+            f"gpu_fallbacks={ACCELERATOR.fallback_count} | "
             f"log={args.log_file.resolve()}"
         )
     except Exception:
         STATUS_LINE.clear()
+        ACCELERATOR.release_memory()
         log_resource_snapshot("process_failure", args.output)
         LOGGER.exception(
             "Quantification failed after %.3f seconds; detailed traceback follows",

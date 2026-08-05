@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Full CUDA acceleration for Quantification 3 on CUDA 12.x.
+# The [ctk] extra supplies the CUDA runtime components when only an NVIDIA
+# driver (rather than a system-wide CUDA Toolkit) is installed.
+cupy-cuda12x[ctk]>=14.1
