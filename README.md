@@ -519,12 +519,12 @@ for distance transforms, morphology, structure tensors, and Hessian filters.
 Without CuPy, the job still uses PyTorch CUDA for probability reductions and
 logs which remaining stages fall back to the CPU.
 
-Quantification uses unlimited `--gpu-memory-mode managed` and
-`--gpu-memory-fraction 1.0` by default. On CUDA devices that report concurrent
-managed access, CuPy Unified Memory can use both dedicated VRAM and system RAM.
-On unsupported platforms the script warns that shared RAM cannot safely extend
-CUDA capacity. Set `GPU_MEMORY_MODE=auto` to use managed memory only after that
-capability check or `GPU_MEMORY_MODE=device` to force dedicated VRAM. Ctrl+C is polled
+Quantification uses `--gpu-memory-mode auto` and `--gpu-memory-fraction 1.0`
+by default. On CUDA devices that report concurrent managed access, CuPy Unified
+Memory can use both dedicated VRAM and system RAM. On unsupported platforms it
+automatically uses the full dedicated-VRAM pool without disabling CuPy. Set
+`GPU_MEMORY_MODE=managed` to prefer managed memory with a safe device-memory
+retry or `GPU_MEMORY_MODE=device` to force dedicated VRAM. Ctrl+C is polled
 during queued CUDA work and exits cleanly with status 130; a second Ctrl+C
 forces immediate termination.
 

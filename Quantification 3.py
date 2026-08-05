@@ -299,7 +299,7 @@ class AccelerationBackend:
         self.device_index = 0
         self.device_name = "CPU"
         self.memory_fraction = 1.0
-        self.requested_memory_mode = "managed"
+        self.requested_memory_mode = "auto"
         self.memory_mode = "unavailable"
         self.managed_memory_limit_bytes = 0
         self.concurrent_managed_access = False
@@ -371,7 +371,7 @@ class AccelerationBackend:
                     raise RuntimeError(
                         f"--cuda-device {args.cuda_device} is invalid; "
                         f"CuPy reports {device_count} CUDA device(s)"
-                )
+                    )
                 cupy.cuda.Device(args.cuda_device).use()
                 self.cupy = cupy
                 self.cupy_ndi = cupy_ndi
@@ -385,9 +385,30 @@ class AccelerationBackend:
                     self._cuda_property(properties, "pageableMemoryAccess")
                 )
                 self._configure_cupy_allocator(args)
-                test_value = cupy.asarray([1.0], dtype=cupy.float32)
-                self.wait_for_cupy("cupy_initialization")
-                del test_value
+                try:
+                    self._test_cupy_allocator()
+                except Exception as managed_error:
+                    if self.memory_mode != "managed":
+                        raise
+                    log(
+                        "CuPy managed-memory initialization failed; retrying "
+                        "with the dedicated-VRAM allocator so CuPy CUDA can "
+                        "remain enabled | "
+                        f"error={type(managed_error).__name__}: "
+                        f"{managed_error}",
+                        logging.WARNING,
+                    )
+                    self._configure_cupy_device_allocator(args)
+                    try:
+                        self._test_cupy_allocator()
+                    except Exception as device_error:
+                        raise RuntimeError(
+                            "CuPy failed with both managed-memory and "
+                            "dedicated-VRAM allocators. Managed error: "
+                            f"{type(managed_error).__name__}: {managed_error}; "
+                            "device error: "
+                            f"{type(device_error).__name__}: {device_error}"
+                        ) from device_error
                 if self.device_name == "CPU":
                     raw_name = self._cuda_property(
                         properties, "name", "CUDA GPU"
@@ -461,20 +482,11 @@ class AccelerationBackend:
                     logging.WARNING,
                 )
                 if cupy_error is not None:
-                    log(f"CuPy initialization detail: {cupy_error}", logging.DEBUG)
-            if (
-                self.cupy_available
-                and self.requested_memory_mode == "auto"
-                and not self.concurrent_managed_access
-            ):
-                log(
-                    "CUDA reports concurrentManagedAccess=0. Shared system "
-                    "memory cannot safely extend CUDA allocation capacity on "
-                    "this platform (common with native Windows/WDDM); CuPy is "
-                    "using dedicated device memory with chunking and CPU "
-                    "fallbacks instead.",
-                    logging.WARNING,
-                )
+                    log(
+                        "CuPy initialization failed | "
+                        f"error={type(cupy_error).__name__}: {cupy_error}",
+                        logging.WARNING,
+                    )
         self._record_args(args)
 
     @staticmethod
@@ -490,8 +502,9 @@ class AccelerationBackend:
 
     def _configure_cupy_allocator(self, args: argparse.Namespace) -> None:
         cupy = self.cupy
-        use_managed = args.gpu_memory_mode == "managed" or (
-            args.gpu_memory_mode == "auto" and self.concurrent_managed_access
+        managed_requested = args.gpu_memory_mode in {"auto", "managed"}
+        use_managed = (
+            managed_requested and self.concurrent_managed_access
         )
         if use_managed:
             managed_pool = cupy.cuda.MemoryPool(cupy.cuda.malloc_managed)
@@ -506,14 +519,32 @@ class AccelerationBackend:
                 "system RAM | "
                 f"pool_limit={format_gib(self.managed_memory_limit_bytes) if self.managed_memory_limit_bytes else 'unlimited'}"
             )
-            if not self.concurrent_managed_access:
-                log(
-                    "Managed memory was explicitly requested, but CUDA reports "
-                    "concurrentManagedAccess=0. It does not provide reliable "
-                    "VRAM oversubscription on this platform and may be slower.",
-                    logging.WARNING,
-                )
             return
+
+        if managed_requested and not self.concurrent_managed_access:
+            log(
+                "CUDA capability concurrentManagedAccess=0 (this is a Boolean "
+                "capability flag, not a shared-memory size). Task Manager may "
+                "still show a Windows shared-GPU-memory budget, but CUDA "
+                "managed allocations cannot use it to oversubscribe physical "
+                "VRAM on this platform. Falling back to the dedicated-VRAM "
+                "allocator; CuPy CUDA acceleration remains enabled and may "
+                "use the full configured device-memory pool.",
+                logging.WARNING,
+            )
+        self._configure_cupy_device_allocator(args)
+
+    def _configure_cupy_device_allocator(
+        self,
+        args: argparse.Namespace,
+    ) -> None:
+        cupy = self.cupy
+        previous_pool = self.cupy_memory_pool
+        if previous_pool is not None:
+            try:
+                previous_pool.free_all_blocks()
+            except Exception:
+                pass
 
         device_pool = cupy.get_default_memory_pool()
         cupy.cuda.set_allocator(device_pool.malloc)
@@ -527,6 +558,15 @@ class AccelerationBackend:
                 "version",
                 logging.DEBUG,
             )
+
+    def _test_cupy_allocator(self) -> None:
+        cupy = self.cupy
+        test_value = None
+        try:
+            test_value = cupy.asarray([1.0], dtype=cupy.float32)
+            self.wait_for_cupy("cupy_initialization")
+        finally:
+            del test_value
 
     def _record_args(self, args: argparse.Namespace) -> None:
         args.resolved_device = self.resolved_device
@@ -634,7 +674,19 @@ class AccelerationBackend:
             return
         event = self.cupy.cuda.Event(disable_timing=True)
         event.record(self.cupy.cuda.get_current_stream())
-        while not event.query():
+        while True:
+            done = getattr(event, "done", None)
+            if done is not None:
+                complete = bool(done() if callable(done) else done)
+            else:
+                query = getattr(event, "query", None)
+                if query is None:
+                    raise AttributeError(
+                        "CuPy CUDA Event provides neither 'done' nor 'query'"
+                    )
+                complete = bool(query())
+            if complete:
+                break
             if _INTERRUPT_REQUESTED:
                 raise KeyboardInterrupt
             time.sleep(0.05)
@@ -1068,12 +1120,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-memory-mode",
         choices=("auto", "device", "managed"),
-        default="managed",
+        default="auto",
         help=(
-            "CuPy allocation mode. The default 'managed' requests unlimited "
-            "CUDA Unified Memory so supported systems can use dedicated VRAM "
-            "and shared system RAM; 'auto' first checks driver capability; "
-            "'device' uses dedicated VRAM only."
+            "CuPy allocation mode. The default 'auto' uses unlimited CUDA "
+            "Unified Memory when the driver supports VRAM oversubscription "
+            "and otherwise uses the full dedicated-VRAM pool. 'managed' "
+            "prefers Unified Memory but safely falls back if unsupported; "
+            "'device' always uses dedicated VRAM."
         ),
     )
     parser.add_argument(
