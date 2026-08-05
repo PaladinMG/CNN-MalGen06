@@ -47,7 +47,8 @@ python "Quantification 3.py" `
   --original-dir "Original Scans" `
   --device cuda `
   --cuda-device 0 `
-  --gpu-memory-fraction 0.80 `
+  --gpu-memory-mode managed `
+  --gpu-memory-fraction 1.0 `
   --analysis-downsample 1 `
   --overwrite
 ```
@@ -60,6 +61,25 @@ probability totals and Euclidean distances retain float64 accumulation/output
 for measurement accuracy. If a CUDA stage fails or runs out of VRAM, it is
 disabled for the remainder of the run, the failure is written to the detailed
 log, and that stage is recalculated on the CPU.
+
+`--gpu-memory-mode managed` is the default and requests an unlimited CUDA
+Unified/managed-memory pool that may migrate between GPU memory and system RAM.
+`--gpu-memory-mode auto` enables that pool only when CUDA reports
+`concurrentManagedAccess`, while `--gpu-memory-mode device` forces the faster
+dedicated-VRAM allocator. `--managed-memory-limit-gb N` can cap the managed
+pool. The default `--gpu-memory-fraction 1.0` permits the full dedicated-memory
+pool, while working-set chunking keeps headroom for temporary CUDA operations.
+Native Windows/WDDM commonly reports no concurrent managed access;
+the "shared GPU memory" shown in Task Manager therefore cannot be treated as
+extra CUDA allocation capacity. The script logs this limitation and retains
+VRAM-aware chunking plus exact CPU fallback. On supported Linux/SLURM systems,
+managed memory can oversubscribe dedicated VRAM, although page migration may
+be considerably slower than keeping the working set in VRAM.
+
+Ctrl+C remains active during CUDA calculations. The script polls queued CUDA
+work and copies results back in bounded chunks, then exits with status 130
+after logging the interruption. Press Ctrl+C a second time during cleanup to
+force an immediate exit.
 
 Image decoding, local rank entropy, region-property tables, contour tracing,
 skeletonization, GLCM calculations, and Excel writing remain CPU-bound. A GPU
@@ -380,7 +400,9 @@ for the laboratory protocol before treating stain values as concentrations.
 --max-pore-rows N             Workbook pore-detail cap.
 --device auto|cpu|cuda        Automatic, CPU-only, or required-CUDA execution.
 --cuda-device N               Zero-based CUDA device index.
---gpu-memory-fraction X       VRAM fraction targeted by automatic chunking.
+--gpu-memory-fraction X       Maximum device-pool VRAM fraction; default 1.0.
+--gpu-memory-mode MODE        auto, device (dedicated), or managed (Unified Memory).
+--managed-memory-limit-gb N   Optional managed-memory pool cap; 0 is unlimited.
 --gpu-chunk-rows N            GPU rows per chunk; 0 selects automatically.
 --gpu-min-pixels N            Minimum array size sent to CUDA.
 --disable-cupy                Keep PyTorch CUDA but use CPU for ndimage filters.

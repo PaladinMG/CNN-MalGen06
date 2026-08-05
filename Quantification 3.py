@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import signal
 import shutil
 import sys
 import time
@@ -65,6 +66,7 @@ EPSILON = np.finfo(np.float32).eps
 SCENE_PATTERN = re.compile(r"^(?P<stem>.+)__scene_(?P<scene>\d+)(?:__\d+)?$")
 LOGGER = logging.getLogger("quantification3")
 _LOGGING_CONFIGURED = False
+_INTERRUPT_REQUESTED = False
 TEXTURE_METRIC_FIELDS = (
     "Analysis pixels",
     "Red mean (0-1)",
@@ -161,6 +163,30 @@ class ConsoleStatusLine:
 
 
 STATUS_LINE = ConsoleStatusLine()
+
+
+def _handle_sigint(_signum: int, _frame: object) -> None:
+    """Make one Ctrl+C graceful and a second Ctrl+C immediately forceful."""
+    global _INTERRUPT_REQUESTED
+    if _INTERRUPT_REQUESTED:
+        os._exit(130)
+    _INTERRUPT_REQUESTED = True
+    raise KeyboardInterrupt
+
+
+def install_interrupt_handler() -> None:
+    """Install the SIGINT handler used by long CPU and CUDA operations."""
+    global _INTERRUPT_REQUESTED
+    _INTERRUPT_REQUESTED = False
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def flush_log_handlers() -> None:
+    for handler in LOGGER.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 class StatusAwareStreamHandler(logging.StreamHandler):
@@ -272,13 +298,19 @@ class AccelerationBackend:
         self.resolved_device = "cpu"
         self.device_index = 0
         self.device_name = "CPU"
-        self.memory_fraction = 0.80
+        self.memory_fraction = 1.0
+        self.requested_memory_mode = "managed"
+        self.memory_mode = "unavailable"
+        self.managed_memory_limit_bytes = 0
+        self.concurrent_managed_access = False
+        self.pageable_memory_access = False
         self.configured_chunk_rows = 0
         self.minimum_pixels = 262_144
         self.torch = None
         self.torch_device = None
         self.cupy = None
         self.cupy_ndi = None
+        self.cupy_memory_pool = None
         self.disabled_stages: set[str] = set()
         self.reported_stages: set[str] = set()
         self.fallback_count = 0
@@ -295,6 +327,10 @@ class AccelerationBackend:
         self.requested_device = args.device
         self.device_index = args.cuda_device
         self.memory_fraction = args.gpu_memory_fraction
+        self.requested_memory_mode = args.gpu_memory_mode
+        self.managed_memory_limit_bytes = int(
+            args.managed_memory_limit_gb * 1024 ** 3
+        )
         self.configured_chunk_rows = args.gpu_chunk_rows
         self.minimum_pixels = args.gpu_min_pixels
         if args.device == "cpu":
@@ -335,28 +371,27 @@ class AccelerationBackend:
                     raise RuntimeError(
                         f"--cuda-device {args.cuda_device} is invalid; "
                         f"CuPy reports {device_count} CUDA device(s)"
-                    )
+                )
                 cupy.cuda.Device(args.cuda_device).use()
-                test_value = cupy.asarray([1.0], dtype=cupy.float32)
-                cupy.cuda.get_current_stream().synchronize()
-                del test_value
                 self.cupy = cupy
                 self.cupy_ndi = cupy_ndi
-                try:
-                    cupy.get_default_memory_pool().set_limit(
-                        fraction=args.gpu_memory_fraction
-                    )
-                except (AttributeError, TypeError):
-                    log(
-                        "CuPy memory-pool fraction limit is unavailable in "
-                        "this CuPy version",
-                        logging.DEBUG,
-                    )
+                properties = cupy.cuda.runtime.getDeviceProperties(
+                    args.cuda_device
+                )
+                self.concurrent_managed_access = bool(
+                    self._cuda_property(properties, "concurrentManagedAccess")
+                )
+                self.pageable_memory_access = bool(
+                    self._cuda_property(properties, "pageableMemoryAccess")
+                )
+                self._configure_cupy_allocator(args)
+                test_value = cupy.asarray([1.0], dtype=cupy.float32)
+                self.wait_for_cupy("cupy_initialization")
+                del test_value
                 if self.device_name == "CPU":
-                    properties = cupy.cuda.runtime.getDeviceProperties(
-                        args.cuda_device
+                    raw_name = self._cuda_property(
+                        properties, "name", "CUDA GPU"
                     )
-                    raw_name = properties.get("name", "CUDA GPU")
                     self.device_name = (
                         raw_name.decode(errors="replace")
                         if isinstance(raw_name, bytes) else str(raw_name)
@@ -365,6 +400,8 @@ class AccelerationBackend:
                 cupy_error = error
                 self.cupy = None
                 self.cupy_ndi = None
+                self.cupy_memory_pool = None
+                self.memory_mode = "unavailable"
 
         self.enabled = self.torch_cuda_available or self.cupy_available
         self.resolved_device = (
@@ -410,6 +447,8 @@ class AccelerationBackend:
                 f"requested={args.device} | resolved={self.resolved_device} | "
                 f"device={self.device_name} | PyTorch CUDA={torch_status} | "
                 f"CuPy ndimage={cupy_status} | "
+                f"gpu_memory_mode={self.memory_mode} | "
+                f"concurrent_managed_access={self.concurrent_managed_access} | "
                 f"memory_fraction={self.memory_fraction:.2f} | "
                 f"gpu_min_pixels={self.minimum_pixels:,}"
             )
@@ -423,13 +462,80 @@ class AccelerationBackend:
                 )
                 if cupy_error is not None:
                     log(f"CuPy initialization detail: {cupy_error}", logging.DEBUG)
+            if (
+                self.cupy_available
+                and self.requested_memory_mode == "auto"
+                and not self.concurrent_managed_access
+            ):
+                log(
+                    "CUDA reports concurrentManagedAccess=0. Shared system "
+                    "memory cannot safely extend CUDA allocation capacity on "
+                    "this platform (common with native Windows/WDDM); CuPy is "
+                    "using dedicated device memory with chunking and CPU "
+                    "fallbacks instead.",
+                    logging.WARNING,
+                )
         self._record_args(args)
+
+    @staticmethod
+    def _cuda_property(
+        properties: dict[object, object],
+        name: str,
+        default: object = 0,
+    ) -> object:
+        if name in properties:
+            return properties[name]
+        encoded_name = name.encode()
+        return properties.get(encoded_name, default)
+
+    def _configure_cupy_allocator(self, args: argparse.Namespace) -> None:
+        cupy = self.cupy
+        use_managed = args.gpu_memory_mode == "managed" or (
+            args.gpu_memory_mode == "auto" and self.concurrent_managed_access
+        )
+        if use_managed:
+            managed_pool = cupy.cuda.MemoryPool(cupy.cuda.malloc_managed)
+            if self.managed_memory_limit_bytes > 0:
+                managed_pool.set_limit(size=self.managed_memory_limit_bytes)
+            cupy.cuda.set_allocator(managed_pool.malloc)
+            self.cupy_memory_pool = managed_pool
+            self.memory_mode = "managed"
+            log(
+                "CuPy CUDA managed-memory allocator enabled | "
+                "allocations may migrate between dedicated GPU memory and "
+                "system RAM | "
+                f"pool_limit={format_gib(self.managed_memory_limit_bytes) if self.managed_memory_limit_bytes else 'unlimited'}"
+            )
+            if not self.concurrent_managed_access:
+                log(
+                    "Managed memory was explicitly requested, but CUDA reports "
+                    "concurrentManagedAccess=0. It does not provide reliable "
+                    "VRAM oversubscription on this platform and may be slower.",
+                    logging.WARNING,
+                )
+            return
+
+        device_pool = cupy.get_default_memory_pool()
+        cupy.cuda.set_allocator(device_pool.malloc)
+        self.cupy_memory_pool = device_pool
+        self.memory_mode = "device"
+        try:
+            device_pool.set_limit(fraction=args.gpu_memory_fraction)
+        except (AttributeError, TypeError):
+            log(
+                "CuPy memory-pool fraction limit is unavailable in this CuPy "
+                "version",
+                logging.DEBUG,
+            )
 
     def _record_args(self, args: argparse.Namespace) -> None:
         args.resolved_device = self.resolved_device
         args.cuda_device_name = self.device_name
         args.pytorch_cuda_enabled = self.torch_cuda_available
         args.cupy_enabled = self.cupy_available
+        args.gpu_memory_mode_resolved = self.memory_mode
+        args.concurrent_managed_access = self.concurrent_managed_access
+        args.pageable_memory_access = self.pageable_memory_access
 
     def should_use_torch(self, pixel_count: int, stage: str) -> bool:
         return (
@@ -470,6 +576,15 @@ class AccelerationBackend:
         if free_bytes is None:
             return min(height, 512)
         budget = int(free_bytes * min(self.memory_fraction, 0.80) * 0.65)
+        if self.memory_mode == "managed" and self.concurrent_managed_access:
+            host_available = available_memory_bytes()
+            if host_available is not None:
+                shared_budget = int(host_available * 0.25)
+                if self.managed_memory_limit_bytes > 0:
+                    shared_budget = min(
+                        shared_budget, self.managed_memory_limit_bytes
+                    )
+                budget += shared_budget
         rows = budget // max(1, width * bytes_per_pixel) - 2 * halo_rows
         return max(1, min(height, 4096, int(rows)))
 
@@ -492,15 +607,72 @@ class AccelerationBackend:
                 pass
         if self.cupy_available:
             try:
-                self.cupy.get_default_memory_pool().free_all_blocks()
+                if self.cupy_memory_pool is not None:
+                    self.cupy_memory_pool.free_all_blocks()
                 self.cupy.get_default_pinned_memory_pool().free_all_blocks()
             except Exception:
                 pass
 
+    def wait_for_torch(self, stage: str) -> None:
+        """Wait for queued CUDA work while continuing to service Ctrl+C."""
+        if not self.torch_cuda_available:
+            return
+        if getattr(self.torch_device, "type", None) != "cuda":
+            return
+        event = self.torch.cuda.Event(enable_timing=False, blocking=False)
+        event.record()
+        while not event.query():
+            if _INTERRUPT_REQUESTED:
+                raise KeyboardInterrupt
+            time.sleep(0.05)
+        if stage not in self.reported_stages:
+            LOGGER.debug("Interruptible CUDA wait completed | stage=%s", stage)
+
+    def wait_for_cupy(self, stage: str) -> None:
+        """Wait for the current CuPy stream without one long synchronization."""
+        if self.cupy is None or not hasattr(self.cupy, "cuda"):
+            return
+        event = self.cupy.cuda.Event(disable_timing=True)
+        event.record(self.cupy.cuda.get_current_stream())
+        while not event.query():
+            if _INTERRUPT_REQUESTED:
+                raise KeyboardInterrupt
+            time.sleep(0.05)
+        if stage not in self.reported_stages:
+            LOGGER.debug("Interruptible CuPy wait completed | stage=%s", stage)
+
+    def cupy_to_numpy(self, value: object, stage: str) -> np.ndarray:
+        """Copy CuPy arrays in bounded pieces so Ctrl+C remains responsive."""
+        cupy = self.cupy
+        self.wait_for_cupy(stage)
+        if value.ndim == 0:
+            return np.asarray(value.item())
+        output = np.empty(value.shape, dtype=value.dtype)
+        if value.ndim == 1:
+            values_per_chunk = max(1, (64 * 1024 ** 2) // value.dtype.itemsize)
+            for start in range(0, value.shape[0], values_per_chunk):
+                if _INTERRUPT_REQUESTED:
+                    raise KeyboardInterrupt
+                stop = min(start + values_per_chunk, value.shape[0])
+                output[start:stop] = cupy.asnumpy(value[start:stop])
+            return output
+        bytes_per_row = int(np.prod(value.shape[1:])) * value.dtype.itemsize
+        rows_per_chunk = max(1, (64 * 1024 ** 2) // max(1, bytes_per_row))
+        for top in range(0, value.shape[0], rows_per_chunk):
+            if _INTERRUPT_REQUESTED:
+                raise KeyboardInterrupt
+            bottom = min(top + rows_per_chunk, value.shape[0])
+            output[top:bottom] = cupy.asnumpy(value[top:bottom])
+        return output
+
     def resource_text(self) -> str:
         if not self.enabled:
             return "gpu=disabled"
-        parts = [f"gpu={self.resolved_device}"]
+        parts = [
+            f"gpu={self.resolved_device}",
+            f"gpu_memory_mode={self.memory_mode}",
+            f"concurrent_managed_access={self.concurrent_managed_access}",
+        ]
         try:
             if self.torch_cuda_available:
                 torch = self.torch
@@ -562,7 +734,7 @@ class AccelerationBackend:
 
             def to_cpu(value: object) -> object:
                 if isinstance(value, cupy.ndarray):
-                    return cupy.asnumpy(value)
+                    return self.cupy_to_numpy(value, stage)
                 if isinstance(value, cupy.generic):
                     return value.item()
                 return value
@@ -886,10 +1058,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpu-memory-fraction",
         type=float,
-        default=0.80,
+        default=1.0,
         help=(
-            "Fraction of currently available VRAM targeted by automatic GPU "
-            "chunking and the CuPy memory pool."
+            "Maximum dedicated-VRAM fraction available to the CuPy device "
+            "memory pool. The default permits the full pool; automatic "
+            "working-set chunking retains temporary-operation headroom."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-memory-mode",
+        choices=("auto", "device", "managed"),
+        default="managed",
+        help=(
+            "CuPy allocation mode. The default 'managed' requests unlimited "
+            "CUDA Unified Memory so supported systems can use dedicated VRAM "
+            "and shared system RAM; 'auto' first checks driver capability; "
+            "'device' uses dedicated VRAM only."
+        ),
+    )
+    parser.add_argument(
+        "--managed-memory-limit-gb",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional CuPy managed-memory pool limit in GiB. Zero leaves the "
+            "pool unlimited; automatic chunking still limits working sets."
         ),
     )
     parser.add_argument(
@@ -991,6 +1184,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--cuda-device cannot be negative")
     if not 0 < args.gpu_memory_fraction <= 1:
         parser.error("--gpu-memory-fraction must be greater than 0 and at most 1")
+    if args.managed_memory_limit_gb < 0:
+        parser.error("--managed-memory-limit-gb cannot be negative")
     if args.gpu_chunk_rows < 0:
         parser.error("--gpu-chunk-rows cannot be negative")
     if args.gpu_min_pixels < 1:
@@ -1706,6 +1901,7 @@ def torch_native_probability_chunk_stats(
             bone_fibro_pair = torch.minimum(
                 normalized[0], normalized[1]
             ) > normalized[2:].amax(dim=0)
+            ACCELERATOR.wait_for_torch(stage)
             result = NativeProbabilityChunkStats(
                 expected_pixels=expected_pixels.cpu().numpy(),
                 hard_confidence_sum=hard_confidence_sum.cpu().numpy(),
@@ -1800,6 +1996,7 @@ def uncertainty_chunk(
                 pair = torch.minimum(
                     normalized[0], normalized[1]
                 ) > normalized[2:].amax(dim=0)
+                ACCELERATOR.wait_for_torch(stage)
                 uncertain_cpu = uncertain.cpu().numpy()
                 pair_cpu = (pair & uncertain).cpu().numpy()
                 if stage not in ACCELERATOR.reported_stages:
@@ -3221,17 +3418,17 @@ def cuda_dense_texture_features(
 
             target_slice = slice(top, bottom)
             local_slice = slice(local_top, local_bottom)
-            gradient_magnitude[target_slice] = cupy.asnumpy(
-                gpu_gradient_magnitude[local_slice]
+            gradient_magnitude[target_slice] = ACCELERATOR.cupy_to_numpy(
+                gpu_gradient_magnitude[local_slice], stage
             )
-            tensor_coherence[target_slice] = cupy.asnumpy(
-                gpu_tensor_coherence[local_slice]
+            tensor_coherence[target_slice] = ACCELERATOR.cupy_to_numpy(
+                gpu_tensor_coherence[local_slice], stage
             )
-            tensor_orientation[target_slice] = cupy.asnumpy(
-                gpu_tensor_orientation[local_slice]
+            tensor_orientation[target_slice] = ACCELERATOR.cupy_to_numpy(
+                gpu_tensor_orientation[local_slice], stage
             )
-            ridge_strength[target_slice] = cupy.asnumpy(
-                gpu_ridge_strength[local_slice]
+            ridge_strength[target_slice] = ACCELERATOR.cupy_to_numpy(
+                gpu_ridge_strength[local_slice], stage
             )
             del (
                 gpu_gray,
@@ -4299,6 +4496,11 @@ def write_readme_sheet(
         ("CUDA device", args.cuda_device_name),
         ("PyTorch CUDA enabled", args.pytorch_cuda_enabled),
         ("CuPy ndimage enabled", args.cupy_enabled),
+        ("Requested GPU memory mode", args.gpu_memory_mode),
+        ("Resolved GPU memory mode", args.gpu_memory_mode_resolved),
+        ("CUDA concurrent managed access", args.concurrent_managed_access),
+        ("CUDA pageable memory access", args.pageable_memory_access),
+        ("Managed-memory pool limit (GiB)", args.managed_memory_limit_gb),
         ("GPU memory fraction", args.gpu_memory_fraction),
         ("GPU chunk rows", args.gpu_chunk_rows or "Automatic"),
         ("GPU minimum pixels", args.gpu_min_pixels),
@@ -4444,6 +4646,7 @@ def verify_workbook(path: Path, expected_scans: int) -> None:
 
 
 def main() -> None:
+    install_interrupt_handler()
     args = parse_args()
     configure_logging(args)
     process_started = time.perf_counter()
@@ -4482,6 +4685,21 @@ def main() -> None:
             f"gpu_fallbacks={ACCELERATOR.fallback_count} | "
             f"log={args.log_file.resolve()}"
         )
+    except KeyboardInterrupt:
+        STATUS_LINE.clear()
+        log(
+            "Keyboard interrupt received. Stopping cleanly; press Ctrl+C "
+            "again to force an immediate exit.",
+            logging.WARNING,
+        )
+        ACCELERATOR.release_memory()
+        log(
+            f"Interrupted after {time.perf_counter() - process_started:.3f} "
+            f"seconds | log={args.log_file.resolve()}",
+            logging.WARNING,
+        )
+        flush_log_handlers()
+        raise SystemExit(130)
     except Exception:
         STATUS_LINE.clear()
         ACCELERATOR.release_memory()
