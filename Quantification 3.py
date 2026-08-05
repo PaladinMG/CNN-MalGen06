@@ -3,12 +3,21 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
+import ctypes
 from dataclasses import dataclass
 from datetime import datetime
 import gc
+import importlib.metadata
+import json
+import logging
 import math
+import os
 from pathlib import Path
+import platform
 import re
+import shutil
+import sys
+import time
 from typing import Iterator, Sequence
 
 import numpy as np
@@ -54,6 +63,8 @@ SKIPPED_FILENAME_ENDINGS = ("20261.png", "20261.czi")
 EXCEL_MAX_ROWS = 1_048_576
 EPSILON = np.finfo(np.float32).eps
 SCENE_PATTERN = re.compile(r"^(?P<stem>.+)__scene_(?P<scene>\d+)(?:__\d+)?$")
+LOGGER = logging.getLogger("quantification3")
+_LOGGING_CONFIGURED = False
 TEXTURE_METRIC_FIELDS = (
     "Analysis pixels",
     "Red mean (0-1)",
@@ -114,8 +125,210 @@ class AnalysisResults:
     pore_rows_omitted: int = 0
 
 
-def log(message: str) -> None:
-    print(f"[Quantification 3] {message}", flush=True)
+class ConsoleStatusLine:
+    def __init__(self) -> None:
+        self.stream = sys.stdout
+        self.enabled = bool(getattr(self.stream, "isatty", lambda: False)())
+        self.visible_length = 0
+
+    def update(self, message: str) -> None:
+        if not self.enabled:
+            return
+        padding = " " * max(0, self.visible_length - len(message))
+        self.stream.write(f"\r{message}{padding}")
+        self.stream.flush()
+        self.visible_length = len(message)
+
+    def clear(self) -> None:
+        if not self.enabled or self.visible_length == 0:
+            return
+        self.stream.write("\r" + " " * self.visible_length + "\r")
+        self.stream.flush()
+        self.visible_length = 0
+
+
+STATUS_LINE = ConsoleStatusLine()
+
+
+class StatusAwareStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        STATUS_LINE.clear()
+        super().emit(record)
+
+
+def log(message: str, level: int = logging.INFO) -> None:
+    if _LOGGING_CONFIGURED:
+        LOGGER.log(level, message)
+    else:
+        print(f"[Quantification 3] {message}", flush=True)
+
+
+def update_status(message: str) -> None:
+    status_message = f"[Quantification 3] {message}"
+    if STATUS_LINE.enabled:
+        if _LOGGING_CONFIGURED:
+            log(f"Status | {message}", logging.DEBUG)
+        STATUS_LINE.update(status_message)
+    elif _LOGGING_CONFIGURED:
+        log(message)
+    else:
+        print(status_message, flush=True)
+
+
+def configure_logging(args: argparse.Namespace) -> Path:
+    global _LOGGING_CONFIGURED
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.log_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = args.output.parent / (
+            f"quantification3_{timestamp}_pid{os.getpid()}.log"
+        )
+    else:
+        log_path = args.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    for handler in list(LOGGER.handlers):
+        handler.close()
+        LOGGER.removeHandler(handler)
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = False
+
+    console_handler = StatusAwareStreamHandler(sys.stdout)
+    console_handler.setLevel(getattr(logging, args.console_log_level))
+    console_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s | %(levelname)-8s | [Quantification 3] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d | %(levelname)-8s | "
+            "pid=%(process)d | %(funcName)s:%(lineno)d | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    LOGGER.addHandler(console_handler)
+    LOGGER.addHandler(file_handler)
+    _LOGGING_CONFIGURED = True
+    args.log_file = log_path
+    log(f"Detailed log file: {log_path.resolve()}")
+    return log_path
+
+
+def package_version(distribution: str) -> str:
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def format_gib(value: int | None) -> str:
+    return "unavailable" if value is None else f"{value / 1024 ** 3:.3f} GiB"
+
+
+def file_size_or_unavailable(path: Path | None) -> int | str:
+    if path is None:
+        return "unavailable"
+    try:
+        return path.stat().st_size
+    except OSError:
+        return "unavailable"
+
+
+def available_memory_bytes() -> int | None:
+    if os.name == "nt":
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return int(status.ullAvailPhys)
+        return None
+    if hasattr(os, "sysconf"):
+        try:
+            return int(
+                os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+            )
+        except (ValueError, OSError):
+            return None
+    return None
+
+
+def process_memory_bytes() -> tuple[int | None, int | None]:
+    if os.name == "nt":
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_ulong),
+                ("PageFaultCount", ctypes.c_ulong),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        process = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(
+            process, ctypes.byref(counters), counters.cb
+        ):
+            return int(counters.WorkingSetSize), int(counters.PeakWorkingSetSize)
+    return None, None
+
+
+def log_resource_snapshot(stage: str, output_path: Path) -> None:
+    current_memory, peak_memory = process_memory_bytes()
+    available_memory = available_memory_bytes()
+    try:
+        disk = shutil.disk_usage(output_path.parent)
+        disk_free = disk.free
+    except OSError:
+        disk_free = None
+    log(
+        "Resource snapshot | "
+        f"stage={stage} | rss={format_gib(current_memory)} | "
+        f"peak_rss={format_gib(peak_memory)} | "
+        f"available_ram={format_gib(available_memory)} | "
+        f"output_disk_free={format_gib(disk_free)}",
+        logging.DEBUG,
+    )
+
+
+def log_startup(args: argparse.Namespace) -> None:
+    log(
+        "Runtime | "
+        f"python={platform.python_version()} | platform={platform.platform()} | "
+        f"pid={os.getpid()} | cwd={Path.cwd()}"
+    )
+    log(
+        "Libraries | "
+        f"numpy={package_version('numpy')} | Pillow={package_version('Pillow')} | "
+        f"scipy={package_version('scipy')} | "
+        f"scikit-image={package_version('scikit-image')} | "
+        f"openpyxl={package_version('openpyxl')}"
+    )
+    log(f"Command | {' '.join(sys.argv)}", logging.DEBUG)
+    for name, value in sorted(vars(args).items()):
+        log(f"Argument | {name}={value}", logging.DEBUG)
+    log_resource_snapshot("startup", args.output)
 
 
 def finite_or_none(value: object) -> object:
@@ -124,6 +337,68 @@ def finite_or_none(value: object) -> object:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def json_measurement_value(value: object) -> object:
+    value = finite_or_none(value)
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def log_measurement_record(
+    category: str,
+    record_index: int,
+    record: dict[str, object],
+) -> None:
+    payload = {
+        key: json_measurement_value(value)
+        for key, value in record.items()
+    }
+    log(
+        f"Measurement | category={category} | record={record_index} | "
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        logging.DEBUG,
+    )
+
+
+def log_all_measurements(
+    results: AnalysisResults,
+    mode: str,
+) -> None:
+    if mode == "none":
+        log("Per-measurement logging disabled by --measurement-log-mode none")
+        return
+    groups: list[tuple[str, list[dict[str, object]]]] = [
+        ("scan_summary", results.scan_rows),
+        ("class_summary", results.class_rows),
+        ("interfaces", results.interface_rows),
+        ("spatial_distances", results.spatial_rows),
+        ("distance_bands", results.distance_band_rows),
+        ("texture_color", results.texture_rows),
+        ("quality_control", results.qc_rows),
+    ]
+    if mode == "all":
+        groups[2:2] = [
+            ("region_details", results.region_rows),
+            ("pore_details", results.pore_rows),
+        ]
+    record_total = sum(len(records) for _, records in groups)
+    log(
+        f"Writing {record_total:,} structured measurement record(s) "
+        f"to the detailed log (mode={mode})"
+    )
+    for category, records in groups:
+        log(
+            f"Measurement category | category={category} | "
+            f"records={len(records):,}",
+            logging.DEBUG,
+        )
+        for record_index, record in enumerate(records, start=1):
+            log_measurement_record(category, record_index, record)
+    log("Structured measurement logging complete")
 
 
 def safe_stat(values: Sequence[float] | np.ndarray, statistic: str) -> float | None:
@@ -213,6 +488,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip skeleton, branch, junction, and local-thickness calculations.",
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        help=(
+            "Detailed UTF-8 log path. By default, a timestamped log is created "
+            "beside the output workbook."
+        ),
+    )
+    parser.add_argument(
+        "--console-log-level",
+        choices=("INFO", "DEBUG"),
+        default="INFO",
+        help="Console verbosity; the file log always includes DEBUG records.",
+    )
+    parser.add_argument(
+        "--measurement-log-mode",
+        choices=("all", "summary", "none"),
+        default="all",
+        help=(
+            "Measurements written to the detailed log. 'all' includes every "
+            "retained region and pore; 'summary' omits object-detail rows."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
@@ -260,15 +558,29 @@ def should_skip_file(path: Path) -> bool:
 
 def build_original_index(root: Path | None) -> dict[str, list[Path]]:
     if root is None:
+        log("Original-image indexing skipped: --original-dir was not supplied", logging.DEBUG)
         return {}
+    started = time.perf_counter()
+    log(f"Indexing original images under: {root.resolve()}")
     index: dict[str, list[Path]] = defaultdict(list)
+    candidate_count = 0
+    skipped_count = 0
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in ORIGINAL_SUFFIXES:
             continue
+        candidate_count += 1
         if should_skip_file(path):
             log(f"Skipping excluded original file: {path}")
+            skipped_count += 1
             continue
         index[path.stem.casefold()].append(path)
+    indexed_count = sum(len(paths) for paths in index.values())
+    log(
+        "Original-image index complete | "
+        f"candidates={candidate_count:,} | indexed={indexed_count:,} | "
+        f"skipped={skipped_count:,} | unique_stems={len(index):,} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
     return index
 
 
@@ -299,7 +611,9 @@ def match_original(
 
 
 def discover_scans(prediction_dir: Path, original_dir: Path | None) -> list[ScanInputs]:
+    started = time.perf_counter()
     full_dir = prediction_dir / "Full Segmentations"
+    log(f"Discovering full segmentations under: {full_dir.resolve()}")
     if not full_dir.is_dir():
         raise FileNotFoundError(f"Missing Full Segmentations directory: {full_dir}")
     candidate_label_paths = sorted(
@@ -307,9 +621,11 @@ def discover_scans(prediction_dir: Path, original_dir: Path | None) -> list[Scan
         if path.is_file() and path.suffix.lower() in RASTER_SUFFIXES
     )
     label_paths = []
+    skipped_label_count = 0
     for path in candidate_label_paths:
         if should_skip_file(path):
             log(f"Skipping excluded segmentation file: {path}")
+            skipped_label_count += 1
         else:
             label_paths.append(path)
     if not label_paths:
@@ -360,6 +676,21 @@ def discover_scans(prediction_dir: Path, original_dir: Path | None) -> list[Scan
                 original_scene=original_scene,
             )
         )
+        log(
+            "Discovered scan inputs | "
+            f"scan={name} | label={label_path} | "
+            f"probability={probability_path or 'unavailable'} | "
+            f"grayscale_maps={sum(path is not None for path in grayscale_paths)}/"
+            f"{len(CLASS_NAMES)} | boundary={boundary_path or 'unavailable'} | "
+            f"original={original_path or 'unavailable'} | scene={original_scene}",
+            logging.DEBUG,
+        )
+    log(
+        "Scan discovery complete | "
+        f"candidates={len(candidate_label_paths):,} | scans={len(scans):,} | "
+        f"skipped={skipped_label_count:,} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
     return scans
 
 
@@ -374,6 +705,12 @@ class ProbabilitySource:
 
     def __enter__(self) -> "ProbabilitySource":
         if self.scan.probability_path is not None:
+            log(
+                f"{self.scan.name}: opening float32 probability volume | "
+                f"path={self.scan.probability_path} | "
+                f"bytes={file_size_or_unavailable(self.scan.probability_path)}",
+                logging.DEBUG,
+            )
             array = np.load(self.scan.probability_path, mmap_mode="r")
             expected_shape = (len(CLASS_NAMES), self.height, self.width)
             if array.shape != expected_shape:
@@ -383,8 +720,17 @@ class ProbabilitySource:
                 )
             self.memmap = array
             self.kind = "float32 probability volume"
+            log(
+                f"{self.scan.name}: probability volume ready | "
+                f"shape={array.shape} | dtype={array.dtype}",
+                logging.DEBUG,
+            )
             return self
         if all(path is not None for path in self.scan.grayscale_paths):
+            log(
+                f"{self.scan.name}: opening six grayscale probability maps",
+                logging.DEBUG,
+            )
             stack = ExitStack()
             try:
                 self.images = [
@@ -400,11 +746,20 @@ class ProbabilitySource:
                         )
                 self._stack = stack
                 self.kind = "8-bit grayscale probability maps"
+                log(
+                    f"{self.scan.name}: grayscale probability maps ready | "
+                    f"dimensions={self.width}x{self.height}",
+                    logging.DEBUG,
+                )
                 return self
             except Exception:
                 stack.close()
                 raise
         self.kind = None
+        log(
+            f"{self.scan.name}: no complete probability source is available",
+            logging.WARNING,
+        )
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
@@ -416,6 +771,10 @@ class ProbabilitySource:
             if mmap is not None:
                 mmap.close()
             self.memmap = None
+        log(
+            f"{self.scan.name}: probability resources closed",
+            logging.DEBUG,
+        )
 
     @property
     def available(self) -> bool:
@@ -585,6 +944,13 @@ def load_label_data(
     downsample: int,
     chunk_rows: int,
 ) -> tuple[np.ndarray, np.ndarray, int, int]:
+    started = time.perf_counter()
+    log(
+        f"Loading indexed segmentation | path={label_path} | "
+        f"bytes={file_size_or_unavailable(label_path)} | downsample={downsample} | "
+        f"chunk_rows={chunk_rows}",
+        logging.DEBUG,
+    )
     try:
         with Image.open(label_path) as image:
             if image.mode not in {"P", "L", "I", "I;16"}:
@@ -594,8 +960,10 @@ def load_label_data(
             palette_remap = palette_class_remap(image, label_path)
             width, height = image.size
             hard_counts = np.zeros(len(CLASS_NAMES), dtype=np.int64)
+            chunk_count = math.ceil(height / chunk_rows)
             for top in range(0, height, chunk_rows):
                 bottom = min(top + chunk_rows, height)
+                chunk_index = top // chunk_rows + 1
                 raw_chunk = np.asarray(
                     image.crop((0, top, width, bottom)), dtype=np.int64
                 )
@@ -605,6 +973,16 @@ def load_label_data(
                 hard_counts += np.bincount(
                     chunk.reshape(-1), minlength=len(CLASS_NAMES)
                 )[: len(CLASS_NAMES)]
+                if (
+                    chunk_index == 1
+                    or chunk_index == chunk_count
+                    or chunk_index % max(1, chunk_count // 10) == 0
+                ):
+                    update_status(
+                        "Reading segmentation | "
+                        f"file={label_path.name} | chunk={chunk_index}/{chunk_count} | "
+                        f"rows={top}:{bottom}"
+                    )
             analysis_width = math.ceil(width / downsample)
             analysis_height = math.ceil(height / downsample)
             resized = image.resize(
@@ -619,6 +997,14 @@ def load_label_data(
                 resized.close()
     except UnidentifiedImageError as error:
         raise ValueError(f"Not a valid segmentation image: {label_path}") from error
+    log(
+        "Indexed segmentation loaded | "
+        f"file={label_path.name} | native={width}x{height} | "
+        f"analysis={analysis_width}x{analysis_height} | "
+        f"hard_counts={dict(zip(CLASS_NAMES, hard_counts.tolist()))} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}",
+        logging.DEBUG,
+    )
     return labels, hard_counts, height, width
 
 
@@ -746,6 +1132,11 @@ def probability_statistics(
     np.ndarray | None,
 ]:
     if not source.available:
+        log(
+            f"{source.scan.name}: probability statistics skipped because no "
+            "probability source is available",
+            logging.WARNING,
+        )
         return (
             {
                 "Probability source": "Unavailable",
@@ -767,6 +1158,11 @@ def probability_statistics(
             None,
         )
 
+    started = time.perf_counter()
+    log(
+        f"{source.scan.name}: calculating native-resolution probability "
+        f"statistics from {source.kind}"
+    )
     expected_pixels = np.zeros(len(CLASS_NAMES), dtype=np.float64)
     hard_confidence_sum = np.zeros(len(CLASS_NAMES), dtype=np.float64)
     hard_confidence_min = np.full(len(CLASS_NAMES), np.inf, dtype=np.float64)
@@ -777,11 +1173,22 @@ def probability_statistics(
     low_margin_count = 0
     bone_fibro_ambiguity_count = 0
     total_pixels = height * width
+    native_chunk_count = math.ceil(height / args.chunk_rows)
 
     with Image.open(label_path) as label_image:
         label_remap = palette_class_remap(label_image, label_path)
         for top in range(0, height, args.chunk_rows):
             bottom = min(top + args.chunk_rows, height)
+            chunk_index = top // args.chunk_rows + 1
+            if (
+                chunk_index == 1
+                or chunk_index == native_chunk_count
+                or chunk_index % max(1, native_chunk_count // 10) == 0
+            ):
+                update_status(
+                    f"{source.scan.name} | native probabilities | "
+                    f"chunk {chunk_index}/{native_chunk_count}"
+                )
             probabilities = np.clip(source.native_chunk(top, bottom), 0.0, 1.0)
             raw_labels = np.asarray(
                 label_image.crop((0, top, width, bottom)), dtype=np.int64
@@ -828,8 +1235,19 @@ def probability_statistics(
     analysis_height, analysis_width = labels_analysis.shape
     uncertain_mask = np.zeros(labels_analysis.shape, dtype=bool)
     bone_fibro_mask = np.zeros(labels_analysis.shape, dtype=bool)
+    analysis_chunk_count = math.ceil(analysis_height / args.chunk_rows)
     for top in range(0, analysis_height, args.chunk_rows):
         bottom = min(top + args.chunk_rows, analysis_height)
+        chunk_index = top // args.chunk_rows + 1
+        if (
+            chunk_index == 1
+            or chunk_index == analysis_chunk_count
+            or chunk_index % max(1, analysis_chunk_count // 10) == 0
+        ):
+            update_status(
+                f"{source.scan.name} | analysis-scale uncertainty | "
+                f"chunk {chunk_index}/{analysis_chunk_count}"
+            )
         probabilities = np.clip(
             source.analysis_chunk(
                 top, bottom, analysis_height, analysis_width
@@ -871,20 +1289,31 @@ def probability_statistics(
                 ),
             }
         )
+    scan_metrics = {
+        "Probability source": source.kind,
+        "Mean normalized entropy": float(entropy_sum / total_pixels),
+        "High-entropy pixel fraction": float(
+            high_entropy_count / total_pixels
+        ),
+        "Low top-two margin fraction": float(
+            low_margin_count / total_pixels
+        ),
+        "Bone-Fibrocartilage ambiguity fraction": float(
+            bone_fibro_ambiguity_count / total_pixels
+        ),
+    }
+    log(
+        "Probability statistics complete | "
+        f"scan={source.scan.name} | source={source.kind} | "
+        f"mean_entropy={scan_metrics['Mean normalized entropy']:.6f} | "
+        f"high_entropy_fraction={scan_metrics['High-entropy pixel fraction']:.6f} | "
+        f"low_margin_fraction={scan_metrics['Low top-two margin fraction']:.6f} | "
+        f"bone_fibro_ambiguity_fraction="
+        f"{scan_metrics['Bone-Fibrocartilage ambiguity fraction']:.6f} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
     return (
-        {
-            "Probability source": source.kind,
-            "Mean normalized entropy": float(entropy_sum / total_pixels),
-            "High-entropy pixel fraction": float(
-                high_entropy_count / total_pixels
-            ),
-            "Low top-two margin fraction": float(
-                low_margin_count / total_pixels
-            ),
-            "Bone-Fibrocartilage ambiguity fraction": float(
-                bone_fibro_ambiguity_count / total_pixels
-            ),
-        },
+        scan_metrics,
         class_rows,
         uncertain_mask,
         bone_fibro_mask,
@@ -1332,7 +1761,11 @@ def analyze_classes(
     pore_rows_omitted = 0
 
     for class_id, class_name in enumerate(CLASS_NAMES):
+        class_started = time.perf_counter()
         log(f"{scan.name}: analyzing class {class_id + 1}/{len(CLASS_NAMES)} ({class_name})")
+        update_status(
+            f"{scan.name} | {class_name} | preparing mask and probability map"
+        )
         mask = labels == class_id
         class_probability = (
             probability_source.analysis_class(
@@ -1343,6 +1776,7 @@ def analyze_classes(
         curvature = None
         inside_distance = None
         if np.any(mask):
+            update_status(f"{scan.name} | {class_name} | curvature and distances")
             if args.skip_curvature:
                 if not args.skip_skeleton:
                     inside_distance = ndi.distance_transform_edt(
@@ -1363,6 +1797,7 @@ def analyze_classes(
                         float(values.mean()) if values.size else None
                     )
         remaining_regions = max(0, args.max_region_rows - len(region_rows))
+        update_status(f"{scan.name} | {class_name} | connected-region morphology")
         morphology_summary, details, component_labels, properties, omitted = (
             component_measurements(
                 scan.name,
@@ -1380,6 +1815,7 @@ def analyze_classes(
         region_rows_omitted += omitted
 
         remaining_pores = max(0, args.max_pore_rows - len(pore_rows))
+        update_status(f"{scan.name} | {class_name} | closed holes and porosity")
         pore_summary, pore_details, pores, pore_omitted = pore_measurements(
             scan.name,
             class_name,
@@ -1390,6 +1826,7 @@ def analyze_classes(
         )
         pore_rows.extend(pore_details)
         pore_rows_omitted += pore_omitted
+        update_status(f"{scan.name} | {class_name} | skeleton and local thickness")
         skeleton_summary = skeleton_measurements(
             mask,
             pores,
@@ -1489,6 +1926,15 @@ def analyze_classes(
             **skeleton_summary,
         }
         class_rows.append(class_row)
+        log(
+            "Class analysis complete | "
+            f"scan={scan.name} | class={class_name} | hard_pixels={hard_pixels:,} | "
+            f"regions={morphology_summary['Region count']:,} | "
+            f"closed_holes={pore_summary['Closed-hole count']:,} | "
+            f"retained_region_rows={len(details):,} | "
+            f"retained_pore_rows={len(pore_details):,} | "
+            f"elapsed_seconds={time.perf_counter() - class_started:.3f}"
+        )
         del mask, component_labels, pores, curvature, inside_distance
         if class_probability is not None:
             del class_probability
@@ -1811,6 +2257,7 @@ def load_original_at_analysis_scale(
 ) -> np.ndarray | None:
     if scan.original_path is None:
         return None
+    started = time.perf_counter()
     log(f"{scan.name}: reading matching original {scan.original_path.name}")
     with open_original_source(scan.original_path, scan.original_scene) as source:
         if (source.height, source.width) != (native_height, native_width):
@@ -1822,8 +2269,19 @@ def load_original_at_analysis_scale(
         output = np.empty(
             (analysis_height, analysis_width, 3), dtype=np.uint8
         )
+        chunk_count = math.ceil(analysis_height / chunk_rows)
         for out_top in range(0, analysis_height, chunk_rows):
             out_bottom = min(out_top + chunk_rows, analysis_height)
+            chunk_index = out_top // chunk_rows + 1
+            if (
+                chunk_index == 1
+                or chunk_index == chunk_count
+                or chunk_index % max(1, chunk_count // 10) == 0
+            ):
+                update_status(
+                    f"{scan.name} | original RGB | chunk "
+                    f"{chunk_index}/{chunk_count}"
+                )
             native_top = math.floor(out_top * native_height / analysis_height)
             native_bottom = math.ceil(
                 out_bottom * native_height / analysis_height
@@ -1853,6 +2311,12 @@ def load_original_at_analysis_scale(
             finally:
                 region_image.close()
                 del region
+    log(
+        "Original image loaded at analysis scale | "
+        f"scan={scan.name} | source={scan.original_path} | "
+        f"analysis_shape={output.shape} | bytes={output.nbytes:,} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
     return output
 
 
@@ -1955,7 +2419,9 @@ def texture_measurements(
             }
             for class_name in CLASS_NAMES
         ]
+    started = time.perf_counter()
     log(f"{scan_name}: calculating RGB, stain, gradient, and texture metrics")
+    update_status(f"{scan_name} | texture | grayscale and gradients")
     gray = np.rint(
         0.2126 * rgb[..., 0]
         + 0.7152 * rgb[..., 1]
@@ -1969,6 +2435,7 @@ def texture_measurements(
         gray, morphology.disk(args.texture_entropy_radius)
     ).astype(np.float32)
 
+    update_status(f"{scan_name} | texture | structure tensor")
     tensor_rr, tensor_rc, tensor_cc = feature.structure_tensor(
         gray_float, sigma=1.0, order="rc"
     )
@@ -1983,6 +2450,7 @@ def texture_measurements(
     )
     del tensor_rr, tensor_rc, tensor_cc, tensor_delta
 
+    update_status(f"{scan_name} | texture | Hessian ridge response")
     hessian_elements = feature.hessian_matrix(
         gray_float,
         sigma=1.0,
@@ -2003,6 +2471,7 @@ def texture_measurements(
                 int(region_row["Region ID"])
             ] = region_row
     for class_id, class_name in enumerate(CLASS_NAMES):
+        update_status(f"{scan_name} | texture | {class_name}")
         mask = labels == class_id
         count = int(np.count_nonzero(mask))
         if not count:
@@ -2068,6 +2537,15 @@ def texture_measurements(
             **masked_glcm_metrics(gray, mask, args.texture_levels),
         }
         rows.append(row)
+        log(
+            "Texture class complete | "
+            f"scan={scan_name} | class={class_name} | pixels={count:,} | "
+            f"rgb_variation={row['Combined RGB variation']:.6f} | "
+            f"local_entropy_mean={row['Local entropy mean (bits)']:.6f} | "
+            f"structure_coherence="
+            f"{row['Structure-tensor coherence mean']:.6f}",
+            logging.DEBUG,
+        )
 
         retained = retained_regions.get(class_name, {})
         if retained:
@@ -2129,6 +2607,10 @@ def texture_measurements(
                 )
             del component_labels
         del selected_rgb, optical_density, hed
+    log(
+        f"{scan_name}: texture measurements complete | "
+        f"rows={len(rows)} | elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
     return rows
 
 
@@ -2158,7 +2640,30 @@ def analyze_scan(
     scan_count: int,
     args: argparse.Namespace,
 ) -> AnalysisResults:
+    scan_started = time.perf_counter()
     log(f"Scan {scan_index}/{scan_count}: {scan.name}")
+    for input_type, path in (
+        ("label", scan.label_path),
+        ("probability", scan.probability_path),
+        ("boundary", scan.boundary_path),
+        ("original", scan.original_path),
+    ):
+        log(
+            "Scan input | "
+            f"scan={scan.name} | type={input_type} | "
+            f"path={path or 'unavailable'} | "
+            f"bytes={file_size_or_unavailable(path)}",
+            logging.DEBUG,
+        )
+    for class_name, path in zip(CLASS_NAMES, scan.grayscale_paths):
+        log(
+            "Scan input | "
+            f"scan={scan.name} | type=grayscale_probability | class={class_name} | "
+            f"path={path or 'unavailable'} | "
+            f"bytes={file_size_or_unavailable(path)}",
+            logging.DEBUG,
+        )
+    log_resource_snapshot(f"scan_{scan_index}_start", args.output)
     labels, hard_counts, native_height, native_width = load_label_data(
         scan.label_path, args.analysis_downsample, args.chunk_rows
     )
@@ -2174,6 +2679,11 @@ def analyze_scan(
         if count == 0
     ]
     if missing_classes:
+        log(
+            f"{scan.name}: missing hard-prediction classes: "
+            + ", ".join(missing_classes),
+            logging.WARNING,
+        )
         qc_rows.append(
             {
                 "Scan": scan.name,
@@ -2183,6 +2693,10 @@ def analyze_scan(
             }
         )
     if int(hard_counts[:-1].sum()) == 0:
+        log(
+            f"{scan.name}: all native-resolution pixels are Background",
+            logging.ERROR,
+        )
         qc_rows.append(
             {
                 "Scan": scan.name,
@@ -2239,6 +2753,8 @@ def analyze_scan(
 
     analysis_pixel_height_um = args.pixel_height_um * args.analysis_downsample
     analysis_pixel_width_um = args.pixel_width_um * args.analysis_downsample
+    stage_started = time.perf_counter()
+    update_status(f"{scan.name} | class-pair interfaces")
     interface_rows, contact_lengths = pair_contact_measurements(
         scan.name,
         labels,
@@ -2248,6 +2764,13 @@ def analyze_scan(
         analysis_pixel_height_um,
         analysis_pixel_width_um,
     )
+    log(
+        f"{scan.name}: interface measurements complete | "
+        f"rows={len(interface_rows)} | "
+        f"elapsed_seconds={time.perf_counter() - stage_started:.3f}"
+    )
+    stage_started = time.perf_counter()
+    update_status(f"{scan.name} | directed spatial distances")
     spatial_rows = spatial_measurements(
         scan.name,
         labels,
@@ -2257,12 +2780,24 @@ def analyze_scan(
         analysis_pixel_width_um,
         args.proximity_um,
     )
+    log(
+        f"{scan.name}: spatial-distance measurements complete | "
+        f"rows={len(spatial_rows)} | "
+        f"elapsed_seconds={time.perf_counter() - stage_started:.3f}"
+    )
+    stage_started = time.perf_counter()
+    update_status(f"{scan.name} | distance bands from Bone")
     distance_band_rows = distance_bands_from_bone(
         scan.name,
         labels,
         analysis_pixel_height_um,
         analysis_pixel_width_um,
         args.distance_bin_um,
+    )
+    log(
+        f"{scan.name}: Bone-distance bands complete | "
+        f"rows={len(distance_band_rows)} | "
+        f"elapsed_seconds={time.perf_counter() - stage_started:.3f}"
     )
 
     contact_total_by_class = defaultdict(float)
@@ -2280,6 +2815,7 @@ def analyze_scan(
         row["Interclass contact length (µm)"] = contact_total_by_class[class_id]
         row["Adjacent class count"] = adjacent_count_by_class[class_id]
 
+    update_status(f"{scan.name} | boundary confidence and uncertainty")
     hard_boundary = hard_boundary_mask(labels)
     uncertain_boundary_fraction = (
         float(np.count_nonzero(hard_boundary & uncertain_mask))
@@ -2322,7 +2858,10 @@ def analyze_scan(
                     "Result": original_error,
                 }
             )
-            log(f"{scan.name}: original-image analysis skipped: {original_error}")
+            log(
+                f"{scan.name}: original-image analysis skipped: {original_error}",
+                logging.WARNING,
+            )
     texture_rows = texture_measurements(
         scan.name, labels, rgb, region_rows, args
     )
@@ -2394,7 +2933,7 @@ def analyze_scan(
     )
     del labels, hard_boundary, boundary_probability, rgb
     gc.collect()
-    return AnalysisResults(
+    results = AnalysisResults(
         scan_rows=[scan_row],
         class_rows=class_rows,
         region_rows=region_rows,
@@ -2407,6 +2946,17 @@ def analyze_scan(
         region_rows_omitted=region_rows_omitted,
         pore_rows_omitted=pore_rows_omitted,
     )
+    log_resource_snapshot(f"scan_{scan_index}_complete", args.output)
+    log(
+        "Scan analysis complete | "
+        f"scan={scan.name} | class_rows={len(class_rows)} | "
+        f"region_rows={len(region_rows):,} | pore_rows={len(pore_rows):,} | "
+        f"interface_rows={len(interface_rows)} | spatial_rows={len(spatial_rows)} | "
+        f"distance_band_rows={len(distance_band_rows):,} | "
+        f"texture_rows={len(texture_rows)} | qc_rows={len(qc_rows)} | "
+        f"elapsed_seconds={time.perf_counter() - scan_started:.3f}"
+    )
+    return results
 
 
 def extend_results(target: AnalysisResults, source: AnalysisResults) -> None:
@@ -2673,6 +3223,12 @@ def write_records_sheet(
     records: list[dict[str, object]],
     table_index: int,
 ) -> None:
+    started = time.perf_counter()
+    update_status(f"Workbook | {name} | {len(records):,} row(s)")
+    log(
+        f"Writing worksheet | name={name} | records={len(records):,}",
+        logging.DEBUG,
+    )
     worksheet = workbook.create_sheet(name)
     worksheet.sheet_view.showGridLines = False
     if not records:
@@ -2794,6 +3350,12 @@ def write_records_sheet(
                 worksheet.cell(row, column).alignment = Alignment(
                     vertical="top", wrap_text=True
                 )
+    log(
+        f"Worksheet complete | name={name} | rows={worksheet.max_row:,} | "
+        f"columns={worksheet.max_column:,} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}",
+        logging.DEBUG,
+    )
 
 
 def write_readme_sheet(
@@ -2865,6 +3427,19 @@ def build_workbook(
     scans: list[ScanInputs],
     results: AnalysisResults,
 ) -> None:
+    started = time.perf_counter()
+    log(
+        "Workbook build started | "
+        f"output={args.output.resolve()} | scans={len(scans):,} | "
+        f"scan_rows={len(results.scan_rows):,} | "
+        f"class_rows={len(results.class_rows):,} | "
+        f"region_rows={len(results.region_rows):,} | "
+        f"pore_rows={len(results.pore_rows):,} | "
+        f"interface_rows={len(results.interface_rows):,} | "
+        f"spatial_rows={len(results.spatial_rows):,} | "
+        f"distance_band_rows={len(results.distance_band_rows):,} | "
+        f"texture_rows={len(results.texture_rows):,} | qc_rows={len(results.qc_rows):,}"
+    )
     workbook = Workbook()
     write_readme_sheet(workbook, args, scans, results)
     sheets = [
@@ -2892,11 +3467,20 @@ def build_workbook(
         worksheet.page_setup.fitToHeight = 0
         worksheet.sheet_properties.tabColor = "5B9BD5"
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    update_status(f"Workbook | saving {args.output.name}")
     workbook.save(args.output)
     workbook.close()
+    log(
+        "Workbook saved | "
+        f"path={args.output.resolve()} | bytes={file_size_or_unavailable(args.output)} | "
+        f"elapsed_seconds={time.perf_counter() - started:.3f}"
+    )
 
 
 def verify_workbook(path: Path, expected_scans: int) -> None:
+    started = time.perf_counter()
+    update_status(f"Workbook | validating {path.name}")
+    log(f"Workbook validation started | path={path.resolve()}", logging.DEBUG)
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
         required = {
@@ -2921,30 +3505,61 @@ def verify_workbook(path: Path, expected_scans: int) -> None:
         value = class_sheet.cell(row=2, column=area_column).value
         if not isinstance(value, (int, float)):
             raise RuntimeError("Numeric workbook values were written as text")
+        log(
+            "Workbook validation passed | "
+            f"sheets={len(workbook.sheetnames)} | scan_rows={scan_sheet.max_row - 1} | "
+            f"class_rows={class_sheet.max_row - 1} | numeric_sample={value} | "
+            f"elapsed_seconds={time.perf_counter() - started:.3f}"
+        )
     finally:
         workbook.close()
 
 
 def main() -> None:
     args = parse_args()
-    log("Step 1/4: discovering scans and optional inputs")
-    scans = discover_scans(args.prediction_dir, args.original_dir)
-    log(f"Discovered {len(scans)} scan(s)")
-    combined = AnalysisResults([], [], [], [], [], [], [], [], [])
-    region_limit = args.max_region_rows
-    pore_limit = args.max_pore_rows
-    log("Step 2/4: calculating measurements")
-    for index, scan in enumerate(scans, start=1):
-        scan_args = argparse.Namespace(**vars(args))
-        scan_args.max_region_rows = max(0, region_limit - len(combined.region_rows))
-        scan_args.max_pore_rows = max(0, pore_limit - len(combined.pore_rows))
-        scan_results = analyze_scan(scan, index, len(scans), scan_args)
-        extend_results(combined, scan_results)
-    log("Step 3/4: writing formatted Excel workbook")
-    build_workbook(args, scans, combined)
-    log("Step 4/4: validating workbook structure and numeric cell types")
-    verify_workbook(args.output, len(scans))
-    log(f"Saved and verified: {args.output.resolve()}")
+    configure_logging(args)
+    process_started = time.perf_counter()
+    log_startup(args)
+    try:
+        log("Step 1/5: discovering scans and optional inputs")
+        scans = discover_scans(args.prediction_dir, args.original_dir)
+        log(f"Discovered {len(scans)} scan(s)")
+        combined = AnalysisResults([], [], [], [], [], [], [], [], [])
+        region_limit = args.max_region_rows
+        pore_limit = args.max_pore_rows
+        log("Step 2/5: calculating measurements")
+        for index, scan in enumerate(scans, start=1):
+            scan_args = argparse.Namespace(**vars(args))
+            scan_args.max_region_rows = max(
+                0, region_limit - len(combined.region_rows)
+            )
+            scan_args.max_pore_rows = max(
+                0, pore_limit - len(combined.pore_rows)
+            )
+            scan_results = analyze_scan(scan, index, len(scans), scan_args)
+            extend_results(combined, scan_results)
+        log("Step 3/5: recording every measurement in the detailed log")
+        log_all_measurements(combined, args.measurement_log_mode)
+        log_resource_snapshot("before_workbook", args.output)
+        log("Step 4/5: writing formatted Excel workbook")
+        build_workbook(args, scans, combined)
+        log("Step 5/5: validating workbook structure and numeric cell types")
+        verify_workbook(args.output, len(scans))
+        log_resource_snapshot("process_complete", args.output)
+        log(
+            f"Saved and verified: {args.output.resolve()} | "
+            f"elapsed_seconds={time.perf_counter() - process_started:.3f} | "
+            f"log={args.log_file.resolve()}"
+        )
+    except Exception:
+        STATUS_LINE.clear()
+        log_resource_snapshot("process_failure", args.output)
+        LOGGER.exception(
+            "Quantification failed after %.3f seconds; detailed traceback follows",
+            time.perf_counter() - process_started,
+        )
+        log(f"Failure log retained at: {args.log_file.resolve()}")
+        raise
 
 
 if __name__ == "__main__":

@@ -40,6 +40,38 @@ python "Quantification 3.py" `
   --overwrite
 ```
 
+## Progress display and detailed logging
+
+When the script runs in an interactive PowerShell or Command Prompt window,
+the current fine-grained progress message is rewritten on one status line. It
+does not continually add new terminal lines. Permanent milestones, warnings,
+and errors still print normally. When output is redirected to a file or the
+script runs under a non-interactive scheduler such as SLURM, the same status
+messages are written as ordinary lines so progress is not lost.
+
+Every run also creates a timestamped UTF-8 log file beside the Excel workbook,
+for example `quantification3_20260805_142530_pid12345.log`. The log records the
+command and options, software versions, input discovery and paths, file sizes,
+scan and class timing, chunk progress, memory and disk snapshots, warnings,
+full exception tracebacks, workbook creation, validation, and each calculated
+measurement. Select a fixed location with `--log-file`:
+
+```powershell
+python "Quantification 3.py" `
+  --prediction-dir prediction `
+  --log-file "prediction/quantification_detailed.log" `
+  --overwrite
+```
+
+Per-measurement entries are structured JSON after `Measurement |`, which makes
+the detailed log both readable and machine-parseable. The default
+`--measurement-log-mode all` logs every workbook record, including retained
+region and pore rows. This may create a large log for whole-slide batches.
+Choose `summary` to log all summary/interface/spatial/texture/QC measurements
+but omit region and pore detail records, or `none` to disable per-measurement
+records. The workbook is unaffected. Use `--console-log-level DEBUG` when the
+same diagnostic detail is also desired on screen.
+
 ## Automatically skipped filenames
 
 The script intentionally excludes every file whose name ends in `20261.png` or
@@ -285,6 +317,9 @@ for the laboratory protocol before treating stain values as concentrations.
 --texture-entropy-radius N    Local-entropy disk radius at analysis scale.
 --max-region-rows N           Workbook region-detail cap.
 --max-pore-rows N             Workbook pore-detail cap.
+--log-file PATH               Detailed-log path; default is beside the workbook.
+--console-log-level LEVEL     INFO or DEBUG terminal detail.
+--measurement-log-mode MODE   all, summary, or none measurement logging.
 --skip-curvature              Skip signed-distance curvature calculations.
 --skip-skeleton               Skip skeleton and thickness calculations.
 --overwrite                   Permit replacing an existing workbook.
