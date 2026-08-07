@@ -1,14 +1,43 @@
 from __future__ import annotations
-import tkinter as tk
-import customtkinter as ct
-import numpy as np
-from tkinter import filedialog, ttk, messagebox
-from pathlib import Path
-import argparse
-from typing import Literal
+from time import perf_counter
 
+
+def print_import_time(module_name: str, started_at: float):
+    elapsed = perf_counter() - started_at
+    print(f"Imported {module_name} in {elapsed:.4f} seconds", flush=True)
+
+
+import_started = perf_counter()
+import tkinter as tk
+print_import_time("tkinter", import_started)
+
+import_started = perf_counter()
+import customtkinter as ct
+print_import_time("customtkinter", import_started)
+
+import_started = perf_counter()
+import numpy as np
+print_import_time("numpy", import_started)
+
+import_started = perf_counter()
+from tkinter import filedialog, ttk, messagebox
+print_import_time("tkinter dialogs and ttk", import_started)
+
+import_started = perf_counter()
+from pathlib import Path
+print_import_time("pathlib.Path", import_started)
+
+import_started = perf_counter()
+from typing import Literal
+print_import_time("typing.Literal", import_started)
+
+import_started = perf_counter()
 from collections.abc import Callable
+print_import_time("collections.abc.Callable", import_started)
+
+import_started = perf_counter()
 from functools import partial
+print_import_time("functools.partial", import_started)
 
 # def button_callback():
 #     print("Button Pressed")
@@ -426,7 +455,9 @@ class GetPatchesFrame(ct.CTkFrame):
         )
 
     def open_patch_selector(self):
+        import_started = perf_counter()
         import napari as nap
+        print_import_time("napari", import_started)
 
         czi_list = self.get_czi_list()
         self.get_images_directory()
@@ -472,6 +503,7 @@ class GetPatchesFrame(ct.CTkFrame):
         self.refresh_patch_count()
 
     def create_patch_selection_controls(self):
+        import_started = perf_counter()
         from qtpy.QtWidgets import (
             QWidget,
             QVBoxLayout,
@@ -479,6 +511,7 @@ class GetPatchesFrame(ct.CTkFrame):
             QLabel,
             QPushButton,
         )
+        print_import_time("qtpy.QtWidgets", import_started)
 
         patch_frame = self
 
@@ -587,7 +620,9 @@ class GetPatchesFrame(ct.CTkFrame):
         return PatchSelectionControls()
 
     def read_czi_overview(self, czi_path: Path) -> np.ndarray:
+        import_started = perf_counter()
         from aicspylibczi import CziFile
+        print_import_time("aicspylibczi.CziFile", import_started)
 
         czi = CziFile(czi_path)
 
@@ -756,7 +791,9 @@ class GetPatchesFrame(ct.CTkFrame):
             x: int,
             y: int,
     ) -> np.ndarray:
+        import_started = perf_counter()
         from aicspylibczi import CziFile
+        print_import_time("aicspylibczi.CziFile", import_started)
 
         czi = CziFile(czi_path)
 
@@ -817,7 +854,9 @@ class GetPatchesFrame(ct.CTkFrame):
         return np.clip(image, 0, 255).astype(np.uint8)
 
     def export_current_patches(self):
+        import_started = perf_counter()
         from PIL import Image
+        print_import_time("PIL.Image", import_started)
 
         if self.rectangle_layer is None:
             return
@@ -1089,6 +1128,9 @@ class Frames:
     def __len__(self):
         return len(self.frame_factories)
 
+    def is_loaded(self, index: int) -> bool:
+        return index in self.frames
+
     def get_frame(self, index: int) -> ct.CTkFrame:
         if index not in self.frames:
             self.frames[index] = self.frame_factories[index]()
@@ -1099,16 +1141,75 @@ class Frames:
 class App(ct.CTk):
     def __init__(self):
         super().__init__()
+        self.startup_sequence()
 
-        self.forward = ct.CTkButton(self, text='->', command=lambda: self.initialize_frame('forward'), state="disabled")
-        self.backward = ct.CTkButton(self, text='<-', command=lambda: self.initialize_frame('backward'))
-        self.forward.grid(row=1, column=1, padx=(5, 10), pady=(0,20), sticky="ew")
-        self.backward.grid(row=1, column=0, padx=(10, 5), pady=(0, 20), sticky="ew")
+    def startup_sequence(self):
+        """Configure the application and display its initial controls."""
+        self.title("Setup")
+        self.geometry("700x600")
+        self.minsize(500, 400)
+        self.resizable(width=True, height=True)
+
+        ct.set_appearance_mode("System")
+        ct.set_default_color_theme("blue")
+
+        self.grid_columnconfigure((0, 1), weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
         self.frames = Frames(self)
-        self.current_frame: tuple[int, ct.CTkFrame | None] = (-1, None)
 
-        self.initialize_frame(direction="forward")
+        self.forward = ct.CTkButton(
+            self,
+            text="->",
+            command=lambda: self.initialize_frame("forward"),
+            state="disabled",
+        )
+        self.backward = ct.CTkButton(
+            self,
+            text="<-",
+            command=lambda: self.initialize_frame("backward"),
+            state="disabled",
+        )
+        self.forward.grid(
+            row=1,
+            column=1,
+            padx=(5, 10),
+            pady=(0, 20),
+            sticky="ew",
+        )
+        self.backward.grid(
+            row=1,
+            column=0,
+            padx=(10, 5),
+            pady=(0, 20),
+            sticky="ew",
+        )
+
+        first_frame = self.load_frame(0)
+        self.current_frame: tuple[int, ct.CTkFrame] = (0, first_frame)
+
+    def load_frame(self, index: int) -> ct.CTkFrame:
+        """Create or retrieve a frame, display it, and report its load time."""
+        started_at = perf_counter()
+        was_cached = self.frames.is_loaded(index)
+        frame = self.frames.get_frame(index)
+
+        frame.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="nsew",
+        )
+
+        elapsed = perf_counter() - started_at
+        source = "cached" if was_cached else "new"
+        print(
+            f"Loaded {type(frame).__name__} ({source}) "
+            f"in {elapsed:.4f} seconds",
+            flush=True,
+        )
+
+        return frame
 
     def initialize_frame(
             self,
@@ -1123,19 +1224,11 @@ class App(ct.CTk):
         if not 0 <= new_index < len(self.frames):
             return
 
-        if self.current_frame[1] is not None:
-            self.current_frame[1].grid_remove()
+        self.current_frame[1].grid_remove()
 
         self.current_frame = (
             new_index,
-            self.frames.get_frame(new_index),
-        )
-
-        self.current_frame[1].grid(
-            row=0,
-            column=0,
-            columnspan=2,
-            sticky="nsew",
+            self.load_frame(new_index),
         )
 
         self.backward.configure(
