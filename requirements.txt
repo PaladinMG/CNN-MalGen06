@@ -7,3 +7,5 @@ imagecodecs>=2026.6.26
 scipy>=1.10
 scikit-image>=0.21
 openpyxl>=3.1
+
+customtkinter>=6.0.0

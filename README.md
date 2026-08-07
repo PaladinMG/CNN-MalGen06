@@ -528,6 +528,13 @@ retry or `GPU_MEMORY_MODE=device` to force dedicated VRAM. Ctrl+C is polled
 during queued CUDA work and exits cleanly with status 130; a second Ctrl+C
 forces immediate termination.
 
+The Quantification 3 workbook now retains at most 50,000 region-detail and
+50,000 pore-detail rows by default; all summary measurements still use every
+detected object. Worksheets explicitly requested above 100,000 rows use lean
+formatting to avoid millions of styled cells. XLSX files are written to a
+temporary path, integrity checked, and atomically moved into place so a failed
+or interrupted save does not leave a partial workbook at the output path.
+
 Schedule prediction only after training succeeds:
 
 ```bash

@@ -20,6 +20,7 @@ import shutil
 import sys
 import time
 from typing import Iterator, Sequence
+import zipfile
 
 import numpy as np
 from PIL import Image, UnidentifiedImageError
@@ -62,6 +63,9 @@ RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 ORIGINAL_SUFFIXES = RASTER_SUFFIXES | {".czi"}
 SKIPPED_FILENAME_ENDINGS = ("20261.png", "20261.czi")
 EXCEL_MAX_ROWS = 1_048_576
+DEFAULT_MAX_REGION_DETAIL_ROWS = 50_000
+DEFAULT_MAX_PORE_DETAIL_ROWS = 50_000
+EXCEL_RICH_FORMAT_MAX_DATA_ROWS = 100_000
 EPSILON = np.finfo(np.float32).eps
 SCENE_PATTERN = re.compile(r"^(?P<stem>.+)__scene_(?P<scene>\d+)(?:__\d+)?$")
 LOGGER = logging.getLogger("quantification3")
@@ -1166,14 +1170,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-region-rows",
         type=int,
-        default=500_000,
-        help="Maximum connected-region detail rows retained in the workbook.",
+        default=DEFAULT_MAX_REGION_DETAIL_ROWS,
+        help=(
+            "Maximum connected-region detail rows retained in the workbook. "
+            f"Default: {DEFAULT_MAX_REGION_DETAIL_ROWS:,}; summary metrics "
+            "still use every region."
+        ),
     )
     parser.add_argument(
         "--max-pore-rows",
         type=int,
-        default=500_000,
-        help="Maximum pore detail rows retained in the workbook.",
+        default=DEFAULT_MAX_PORE_DETAIL_ROWS,
+        help=(
+            "Maximum pore detail rows retained in the workbook. "
+            f"Default: {DEFAULT_MAX_PORE_DETAIL_ROWS:,}; summary metrics "
+            "still use every pore."
+        ),
     )
     parser.add_argument(
         "--skip-curvature",
@@ -4406,6 +4418,17 @@ def write_records_sheet(
         worksheet.freeze_panes = "A2"
         return
     headers = ordered_headers(records)
+    rich_formatting = len(records) <= EXCEL_RICH_FORMAT_MAX_DATA_ROWS
+    if not rich_formatting:
+        worksheet.sheet_view.showGridLines = True
+        log(
+            f"Large worksheet lean-format mode | name={name} | "
+            f"records={len(records):,} | threshold="
+            f"{EXCEL_RICH_FORMAT_MAX_DATA_ROWS:,} | Excel table styling, "
+            "per-cell class fills, number formats, and conditional color "
+            "scales are disabled to keep the workbook openable",
+            logging.WARNING,
+        )
     worksheet.append(headers)
     for record in records:
         worksheet.append([finite_or_none(record.get(header)) for header in headers])
@@ -4422,38 +4445,46 @@ def write_records_sheet(
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = worksheet.dimensions
 
-    table_name = re.sub(r"[^A-Za-z0-9_]", "", f"Table{table_index}{name}")[:250]
-    table = Table(displayName=table_name, ref=worksheet.dimensions)
-    table.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    worksheet.add_table(table)
+    if rich_formatting:
+        table_name = re.sub(
+            r"[^A-Za-z0-9_]", "", f"Table{table_index}{name}"
+        )[:250]
+        table = Table(displayName=table_name, ref=worksheet.dimensions)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        worksheet.add_table(table)
 
     class_columns = [
         index
         for index, header in enumerate(headers, start=1)
         if header in {"Class", "Class A", "Class B", "Source class", "Target class"}
     ]
-    for row in range(2, worksheet.max_row + 1):
-        for column in class_columns:
-            cell = worksheet.cell(row=row, column=column)
-            class_name = str(cell.value)
-            if class_name in CLASS_COLORS:
-                cell.fill = PatternFill("solid", fgColor=CLASS_COLORS[class_name])
-                if class_name in {"Bone", "Cartilage", "Marrow"}:
-                    cell.font = Font(color="FFFFFF")
+    if rich_formatting:
+        for row in range(2, worksheet.max_row + 1):
+            for column in class_columns:
+                cell = worksheet.cell(row=row, column=column)
+                class_name = str(cell.value)
+                if class_name in CLASS_COLORS:
+                    cell.fill = PatternFill(
+                        "solid", fgColor=CLASS_COLORS[class_name]
+                    )
+                    if class_name in {"Bone", "Cartilage", "Marrow"}:
+                        cell.font = Font(color="FFFFFF")
 
     for column_index, header in enumerate(headers, start=1):
-        number_format = excel_number_format(header)
-        for row in range(2, worksheet.max_row + 1):
-            cell = worksheet.cell(row=row, column=column_index)
-            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
-                cell.number_format = number_format
-                cell.alignment = Alignment(horizontal="right")
+        if rich_formatting:
+            number_format = excel_number_format(header)
+            for row in range(2, worksheet.max_row + 1):
+                cell = worksheet.cell(row=row, column=column_index)
+                if isinstance(cell.value, (int, float)) and not isinstance(
+                    cell.value, bool
+                ):
+                    cell.number_format = number_format
         sample_values = [header]
         for row in range(2, min(worksheet.max_row, 200) + 1):
             value = worksheet.cell(row=row, column=column_index).value
@@ -4462,28 +4493,28 @@ def write_records_sheet(
         worksheet.column_dimensions[get_column_letter(column_index)].width = min(
             max(maximum + 2, 11), 42
         )
-    for row in range(2, worksheet.max_row + 1):
-        worksheet.row_dimensions[row].height = 18
+    worksheet.sheet_format.defaultRowHeight = 18
 
     fraction_columns = [
         index
         for index, header in enumerate(headers, start=1)
         if "fraction" in header.casefold()
     ]
-    for column in fraction_columns:
-        letter = get_column_letter(column)
-        worksheet.conditional_formatting.add(
-            f"{letter}2:{letter}{worksheet.max_row}",
-            ColorScaleRule(
-                start_type="min",
-                start_color="F7FBFF",
-                mid_type="percentile",
-                mid_value=50,
-                mid_color="9ECAE1",
-                end_type="max",
-                end_color="08519C",
-            ),
-        )
+    if rich_formatting:
+        for column in fraction_columns:
+            letter = get_column_letter(column)
+            worksheet.conditional_formatting.add(
+                f"{letter}2:{letter}{worksheet.max_row}",
+                ColorScaleRule(
+                    start_type="min",
+                    start_color="F7FBFF",
+                    mid_type="percentile",
+                    mid_value=50,
+                    mid_color="9ECAE1",
+                    end_type="max",
+                    end_color="08519C",
+                ),
+            )
 
     freeze_locations = {
         "Scan Summary": "B2",
@@ -4563,6 +4594,9 @@ def write_readme_sheet(
         ("High normalized-entropy threshold", args.high_entropy_threshold),
         ("Proximity distance (µm)", args.proximity_um),
         ("Distance-band width (µm)", args.distance_bin_um),
+        ("Region detail row cap", args.max_region_rows),
+        ("Pore detail row cap", args.max_pore_rows),
+        ("Rich-format row threshold", EXCEL_RICH_FORMAT_MAX_DATA_ROWS),
         ("Region detail rows omitted", results.region_rows_omitted),
         ("Pore detail rows omitted", results.pore_rows_omitted),
         ("Detailed notes", "Quantification 3 Notes.md beside the script"),
@@ -4651,8 +4685,24 @@ def build_workbook(
         worksheet.sheet_properties.tabColor = "5B9BD5"
     args.output.parent.mkdir(parents=True, exist_ok=True)
     update_status(f"Workbook | saving {args.output.name}")
-    workbook.save(args.output)
-    workbook.close()
+    temporary_output = args.output.with_name(
+        f".{args.output.stem}.writing_pid{os.getpid()}{args.output.suffix}"
+    )
+    try:
+        workbook.save(temporary_output)
+        workbook.close()
+        with zipfile.ZipFile(temporary_output, mode="r") as archive:
+            damaged_member = archive.testzip()
+        if damaged_member is not None:
+            raise RuntimeError(
+                "Generated Excel workbook failed ZIP integrity validation at "
+                f"member: {damaged_member}"
+            )
+        os.replace(temporary_output, args.output)
+    finally:
+        workbook.close()
+        if temporary_output.exists():
+            temporary_output.unlink()
     log(
         "Workbook saved | "
         f"path={args.output.resolve()} | bytes={file_size_or_unavailable(args.output)} | "
@@ -4660,10 +4710,21 @@ def build_workbook(
     )
 
 
-def verify_workbook(path: Path, expected_scans: int) -> None:
+def verify_workbook(
+    path: Path,
+    expected_scans: int,
+    expected_region_rows: int | None = None,
+    expected_pore_rows: int | None = None,
+) -> None:
     started = time.perf_counter()
     update_status(f"Workbook | validating {path.name}")
     log(f"Workbook validation started | path={path.resolve()}", logging.DEBUG)
+    with zipfile.ZipFile(path, mode="r") as archive:
+        damaged_member = archive.testzip()
+    if damaged_member is not None:
+        raise RuntimeError(
+            f"Workbook ZIP member is damaged: {damaged_member}"
+        )
     workbook = load_workbook(path, read_only=True, data_only=False)
     try:
         required = {
@@ -4688,10 +4749,34 @@ def verify_workbook(path: Path, expected_scans: int) -> None:
         value = class_sheet.cell(row=2, column=area_column).value
         if not isinstance(value, (int, float)):
             raise RuntimeError("Numeric workbook values were written as text")
+        detail_counts = {}
+        for sheet_name, expected_rows in (
+            ("Region Details", expected_region_rows),
+            ("Pore Details", expected_pore_rows),
+        ):
+            worksheet = workbook[sheet_name]
+            empty_placeholder = (
+                expected_rows == 0
+                and worksheet.max_row == 2
+                and worksheet.cell(row=1, column=1).value == "Status"
+                and worksheet.cell(row=2, column=1).value
+                == "No records were generated"
+            )
+            actual_rows = (
+                0 if empty_placeholder else max(0, worksheet.max_row - 1)
+            )
+            detail_counts[sheet_name] = actual_rows
+            if expected_rows is not None and actual_rows != expected_rows:
+                raise RuntimeError(
+                    f"{sheet_name} has {actual_rows:,} data rows; expected "
+                    f"{expected_rows:,}"
+                )
         log(
             "Workbook validation passed | "
             f"sheets={len(workbook.sheetnames)} | scan_rows={scan_sheet.max_row - 1} | "
             f"class_rows={class_sheet.max_row - 1} | numeric_sample={value} | "
+            f"region_detail_rows={detail_counts['Region Details']:,} | "
+            f"pore_detail_rows={detail_counts['Pore Details']:,} | "
             f"elapsed_seconds={time.perf_counter() - started:.3f}"
         )
     finally:
@@ -4724,13 +4809,46 @@ def main() -> None:
             scan_results = analyze_scan(scan, index, len(scans), scan_args)
             extend_results(combined, scan_results)
             ACCELERATOR.release_memory()
+        if combined.region_rows_omitted:
+            combined.qc_rows.append(
+                {
+                    "Scan": "All scans",
+                    "Severity": "Information",
+                    "Check": "Region detail export cap",
+                    "Result": (
+                        f"Retained {len(combined.region_rows):,} region-detail "
+                        f"rows and omitted {combined.region_rows_omitted:,}. "
+                        "All class-level counts and distribution summaries "
+                        "still use every detected region."
+                    ),
+                }
+            )
+        if combined.pore_rows_omitted:
+            combined.qc_rows.append(
+                {
+                    "Scan": "All scans",
+                    "Severity": "Information",
+                    "Check": "Pore detail export cap",
+                    "Result": (
+                        f"Retained {len(combined.pore_rows):,} pore-detail "
+                        f"rows and omitted {combined.pore_rows_omitted:,}. "
+                        "All class-level counts and porosity summaries still "
+                        "use every detected pore."
+                    ),
+                }
+            )
         log("Step 3/5: recording every measurement in the detailed log")
         log_all_measurements(combined, args.measurement_log_mode)
         log_resource_snapshot("before_workbook", args.output)
         log("Step 4/5: writing formatted Excel workbook")
         build_workbook(args, scans, combined)
         log("Step 5/5: validating workbook structure and numeric cell types")
-        verify_workbook(args.output, len(scans))
+        verify_workbook(
+            args.output,
+            len(scans),
+            len(combined.region_rows),
+            len(combined.pore_rows),
+        )
         log_resource_snapshot("process_complete", args.output)
         log(
             f"Saved and verified: {args.output.resolve()} | "

@@ -217,11 +217,24 @@ downsampling value consistently across specimens. If memory remains limited,
 increase the factor to 8. If curvature or skeleton measurements are not needed,
 `--skip-curvature` and `--skip-skeleton` reduce processing time and memory.
 
-The detailed `Region Details` and `Pore Details` sheets are capped at 500,000
-rows by default because Excel worksheets have a hard row limit. The retained
-objects are the largest objects encountered within each class. Class-level
-counts and distribution summaries still use every detected object. Change the
-caps with `--max-region-rows` and `--max-pore-rows`.
+The detailed `Region Details` and `Pore Details` sheets are each capped at
+50,000 rows by default. The previous 500,000-row defaults could create more
+than 16 million populated cells in `Region Details` alone; rich table and
+per-cell formatting at that scale could make Excel extremely slow or unable to
+open the workbook on a practical workstation. The retained objects are the
+largest objects encountered within each class. Class-level counts and
+distribution summaries still use every detected object, so reducing these
+detail caps does not change area, count, distribution, topology, or porosity
+summary results. Change the caps with `--max-region-rows` and
+`--max-pore-rows`.
+
+If either limit is explicitly raised above 100,000 rows, that worksheet uses
+lean formatting automatically: the header, filters, frozen panes, sampled
+column widths, and native numeric cell types remain, but Excel table styling,
+per-cell tissue colors and number formats, custom row heights, and conditional
+color scales are omitted. This materially reduces workbook size and opening
+cost. Saving is atomic: the script first writes a hidden temporary workbook,
+checks the XLSX ZIP integrity, and only then replaces the requested output.
 
 ## Workbook structure
 
@@ -401,8 +414,8 @@ for the laboratory protocol before treating stain values as concentrations.
 --distance-bin-um X           Width of distance bands from Bone.
 --texture-levels N            Quantization levels for GLCM texture.
 --texture-entropy-radius N    Local-entropy disk radius at analysis scale.
---max-region-rows N           Workbook region-detail cap.
---max-pore-rows N             Workbook pore-detail cap.
+--max-region-rows N           Region-detail cap; default 50,000.
+--max-pore-rows N             Pore-detail cap; default 50,000.
 --device auto|cpu|cuda        Automatic, CPU-only, or required-CUDA execution.
 --cuda-device N               Zero-based CUDA device index.
 --gpu-memory-fraction X       Maximum device-pool VRAM fraction; default 1.0.

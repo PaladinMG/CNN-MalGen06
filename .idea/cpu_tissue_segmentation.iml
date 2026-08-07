@@ -5,8 +5,10 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/Original Scans" />
       <excludeFolder url="file://$MODULE_DIR$/QuPath Project" />
+      <excludeFolder url="file://$MODULE_DIR$/GUI/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/GUI/New folder/.venv" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.14 (cpu_tissue_segmentation) (3)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="~\Documents\Codex\2026-07-27\b\outputs\cpu_tissue_segmentation\GUI\.venv" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">
