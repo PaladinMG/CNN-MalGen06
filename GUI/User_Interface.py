@@ -1,6 +1,9 @@
 from __future__ import annotations
 from time import perf_counter
 
+SCRIPT_STARTED_AT = perf_counter()
+print("Entered User_Interface.py", flush=True)
+
 
 def print_import_time(module_name: str, started_at: float):
     elapsed = perf_counter() - started_at
@@ -18,6 +21,14 @@ print_import_time("customtkinter", import_started)
 import_started = perf_counter()
 import numpy as np
 print_import_time("numpy", import_started)
+
+import_started = perf_counter()
+import os
+print_import_time("os", import_started)
+
+import_started = perf_counter()
+import sys
+print_import_time("sys", import_started)
 
 import_started = perf_counter()
 from tkinter import filedialog, ttk, messagebox
@@ -38,6 +49,44 @@ print_import_time("collections.abc.Callable", import_started)
 import_started = perf_counter()
 from functools import partial
 print_import_time("functools.partial", import_started)
+
+
+def configure_qt_dpi_awareness():
+    """
+    Let CustomTkinter own Windows process DPI awareness.
+
+    Qt otherwise tries to set process DPI awareness again when Napari opens,
+    which produces a SetProcessDpiAwarenessContext warning on Windows.
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    platform = os.environ.get("QT_QPA_PLATFORM", "")
+
+    if not platform:
+        os.environ["QT_QPA_PLATFORM"] = "windows:dpiawareness=0"
+    else:
+        platform_name, _separator, arguments = platform.partition(":")
+
+        if platform_name.lower() != "windows":
+            return
+
+        if "dpiawareness=" in arguments.lower():
+            return
+
+        arguments = ",".join(
+            argument
+            for argument in (arguments, "dpiawareness=0")
+            if argument
+        )
+        os.environ["QT_QPA_PLATFORM"] = (
+            f"{platform_name}:{arguments}"
+        )
+
+    print(
+        "Configured Qt to reuse CustomTkinter's Windows DPI awareness",
+        flush=True,
+    )
 
 # def button_callback():
 #     print("Button Pressed")
@@ -326,6 +375,7 @@ class GetPatchesFrame(ct.CTkFrame):
     PATCH_SIZE = 4096
     DISPLAY_SCALE = 1 / 8
     DISPLAY_PATCH_SIZE = PATCH_SIZE * DISPLAY_SCALE
+    PATCH_EDGE_WIDTH = 8
 
     def __init__(
         self,
@@ -469,13 +519,17 @@ class GetPatchesFrame(ct.CTkFrame):
             title="Training Patch Selection"
         )
 
+        # Add the image first so the shapes layer is rendered above it.
+        self.load_current_czi()
+
         self.rectangle_layer = self.viewer.add_shapes(
             name="Selected patches",
             shape_type="rectangle",
-            edge_width=3,
+            edge_width=self.PATCH_EDGE_WIDTH,
             edge_color="red",
             face_color="transparent",
         )
+        self.keep_rectangle_layer_on_top()
 
         self.viewer.mouse_drag_callbacks.append(
             self.place_patch
@@ -488,8 +542,6 @@ class GetPatchesFrame(ct.CTkFrame):
             name="Patch Selection",
             area="right",
         )
-
-        self.load_current_czi()
 
         # This blocks the Tkinter window while napari is open.
         # Execution resumes after the napari viewer closes.
@@ -698,6 +750,7 @@ class GetPatchesFrame(ct.CTkFrame):
             self.image_layer.name = self.current_czi_path.name
 
         self.clear_rectangles()
+        self.keep_rectangle_layer_on_top()
 
         self.viewer.reset_view()
 
@@ -705,6 +758,18 @@ class GetPatchesFrame(ct.CTkFrame):
             self.napari_controls.update_scan_label()
             self.napari_controls.update_navigation_buttons()
             self.napari_controls.update_selection_label()
+
+    def keep_rectangle_layer_on_top(self):
+        """Keep patch outlines above the CZI image in Napari's layer list."""
+        if self.viewer is None or self.rectangle_layer is None:
+            return
+
+        layers = self.viewer.layers
+        rectangle_index = layers.index(self.rectangle_layer)
+        top_index = len(layers) - 1
+
+        if rectangle_index != top_index:
+            layers.move(rectangle_index, len(layers))
 
     def place_patch(self, viewer, event):
         """
@@ -766,9 +831,11 @@ class GetPatchesFrame(ct.CTkFrame):
 
         self.rectangle_layer.add_rectangles(
             rectangle,
+            edge_width=self.PATCH_EDGE_WIDTH,
             edge_color="red",
             face_color="transparent",
         )
+        self.keep_rectangle_layer_on_top()
 
         if self.napari_controls is not None:
             self.napari_controls.set_status(
@@ -1140,8 +1207,23 @@ class Frames:
 
 class App(ct.CTk):
     def __init__(self):
+        configure_qt_dpi_awareness()
+
+        root_started_at = perf_counter()
         super().__init__()
+        print(
+            "Created CustomTkinter root in "
+            f"{perf_counter() - root_started_at:.4f} seconds",
+            flush=True,
+        )
+
+        startup_started_at = perf_counter()
         self.startup_sequence()
+        print(
+            "Completed startup sequence in "
+            f"{perf_counter() - startup_started_at:.4f} seconds",
+            flush=True,
+        )
 
     def startup_sequence(self):
         """Configure the application and display its initial controls."""
@@ -1252,7 +1334,21 @@ class App(ct.CTk):
 
 
 def main():
+    print(
+        "Completed module setup in "
+        f"{perf_counter() - SCRIPT_STARTED_AT:.4f} seconds",
+        flush=True,
+    )
+
+    app_started_at = perf_counter()
     app = App()
+    app.update_idletasks()
+    print(
+        "User interface ready in "
+        f"{perf_counter() - app_started_at:.4f} seconds; "
+        "entering the event loop",
+        flush=True,
+    )
     app.mainloop()
 
 if __name__ == "__main__":
