@@ -4,23 +4,11 @@ import customtkinter as ct
 import numpy as np
 from tkinter import filedialog, ttk, messagebox
 from pathlib import Path
-import napari as nap
 import argparse
 from typing import Literal
 
 from collections.abc import Callable
 from functools import partial
-
-from aicspylibczi import CziFile
-from PIL import Image
-from qtpy.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-)
-
 
 # def button_callback():
 #     print("Button Pressed")
@@ -149,8 +137,13 @@ class FolderSelectFrame(ct.CTkFrame):
 
         selected_dir = Path(folder_path)
 
-        # Raise an error if the selected directory contains anything.
-        if any(selected_dir.iterdir()):
+        # Existing application output directories are safe to resume.
+        contains_output_folder = any(
+            (selected_dir / folder_name).is_dir()
+            for folder_name in ("dataset", "prediction")
+        )
+
+        if any(selected_dir.iterdir()) and not contains_output_folder:
             raise ValueError(
                 f"The selected folder is not empty: {selected_dir}"
             )
@@ -325,7 +318,7 @@ class GetPatchesFrame(ct.CTkFrame):
         self.patch_count = 0
         self.current_czi_index = 0
 
-        self.viewer: nap.Viewer | None = None
+        self.viewer = None
         self.image_layer = None
         self.rectangle_layer = None
         self.napari_controls = None
@@ -433,6 +426,8 @@ class GetPatchesFrame(ct.CTkFrame):
         )
 
     def open_patch_selector(self):
+        import napari as nap
+
         czi_list = self.get_czi_list()
         self.get_images_directory()
 
@@ -455,7 +450,7 @@ class GetPatchesFrame(ct.CTkFrame):
             self.place_patch
         )
 
-        self.napari_controls = PatchSelectionControls(self)
+        self.napari_controls = self.create_patch_selection_controls()
 
         self.viewer.window.add_dock_widget(
             self.napari_controls,
@@ -476,7 +471,124 @@ class GetPatchesFrame(ct.CTkFrame):
 
         self.refresh_patch_count()
 
+    def create_patch_selection_controls(self):
+        from qtpy.QtWidgets import (
+            QWidget,
+            QVBoxLayout,
+            QHBoxLayout,
+            QLabel,
+            QPushButton,
+        )
+
+        patch_frame = self
+
+        class PatchSelectionControls(QWidget):
+            """
+            Dock widget containing the instructions and controls for napari.
+            """
+
+            def __init__(self):
+                super().__init__()
+
+                self.patch_frame = patch_frame
+
+                layout = QVBoxLayout()
+                self.setLayout(layout)
+
+                instructions = QLabel(
+                    "Instructions:\n\n"
+                    "1. Left-click the scan to place a centered "
+                    "4096 × 4096 patch.\n"
+                    "2. Place as many patches as needed.\n"
+                    "3. Click Export Current Patches to save all "
+                    "rectangles from this scan.\n"
+                    "4. Use Previous Scan and Next Scan to move "
+                    "between CZI files.\n"
+                    "5. Click Done when patch selection is complete."
+                )
+                instructions.setWordWrap(True)
+                layout.addWidget(instructions)
+
+                self.scan_label = QLabel()
+                self.scan_label.setWordWrap(True)
+                layout.addWidget(self.scan_label)
+
+                self.selection_label = QLabel()
+                layout.addWidget(self.selection_label)
+
+                self.status_label = QLabel("")
+                self.status_label.setWordWrap(True)
+                layout.addWidget(self.status_label)
+
+                export_button = QPushButton("Export Current Patches")
+                export_button.clicked.connect(
+                    self.patch_frame.export_current_patches
+                )
+                layout.addWidget(export_button)
+
+                clear_button = QPushButton("Clear Unexported Rectangles")
+                clear_button.clicked.connect(
+                    self.patch_frame.clear_rectangles
+                )
+                layout.addWidget(clear_button)
+
+                navigation_layout = QHBoxLayout()
+
+                self.previous_button = QPushButton("Previous Scan")
+                self.previous_button.clicked.connect(
+                    self.patch_frame.previous_czi
+                )
+                navigation_layout.addWidget(self.previous_button)
+
+                self.next_button = QPushButton("Next Scan")
+                self.next_button.clicked.connect(
+                    self.patch_frame.next_czi
+                )
+                navigation_layout.addWidget(self.next_button)
+
+                layout.addLayout(navigation_layout)
+
+                done_button = QPushButton("Done")
+                done_button.clicked.connect(self.patch_frame.close_napari)
+                layout.addWidget(done_button)
+
+                self.update_scan_label()
+                self.update_navigation_buttons()
+                self.update_selection_label()
+
+            def update_scan_label(self):
+                czi_list = self.patch_frame.get_czi_list()
+                index = self.patch_frame.current_czi_index
+                czi_path = czi_list[index]
+
+                self.scan_label.setText(
+                    f"Current scan: {index + 1} of {len(czi_list)}\n"
+                    f"{czi_path.name}"
+                )
+
+            def update_navigation_buttons(self):
+                czi_list = self.patch_frame.get_czi_list()
+                index = self.patch_frame.current_czi_index
+
+                self.previous_button.setEnabled(index > 0)
+                self.next_button.setEnabled(index < len(czi_list) - 1)
+
+            def update_selection_label(self):
+                layer = self.patch_frame.rectangle_layer
+                selection_count = len(layer.data) if layer is not None else 0
+
+                self.selection_label.setText(
+                    f"Unexported selections: {selection_count}"
+                )
+
+            def set_status(self, message: str):
+                self.status_label.setText(message)
+
+        return PatchSelectionControls()
+
     def read_czi_overview(self, czi_path: Path) -> np.ndarray:
+        from aicspylibczi import CziFile
+
         czi = CziFile(czi_path)
 
         if not czi.is_mosaic():
@@ -644,6 +756,8 @@ class GetPatchesFrame(ct.CTkFrame):
             x: int,
             y: int,
     ) -> np.ndarray:
+        from aicspylibczi import CziFile
+
         czi = CziFile(czi_path)
 
         patch = czi.read_mosaic(
@@ -703,6 +817,8 @@ class GetPatchesFrame(ct.CTkFrame):
         return np.clip(image, 0, 255).astype(np.uint8)
 
     def export_current_patches(self):
+        from PIL import Image
+
         if self.rectangle_layer is None:
             return
 
@@ -952,158 +1068,32 @@ class GetPatchesFrame(ct.CTkFrame):
         dialog.destroy()
         self.refresh_patch_count()
 
-class PatchSelectionControls(QWidget):
-    """
-    Dock widget containing the instructions and controls for napari.
-    """
-
-    def __init__(self, patch_frame: GetPatchesFrame):
-        super().__init__()
-
-        self.patch_frame = patch_frame
-
-        layout = QVBoxLayout()
-        self.setLayout(layout)
-
-        instructions = QLabel(
-            "Instructions:\n\n"
-            "1. Left-click the scan to place a centered "
-            "4096 × 4096 patch.\n"
-            "2. Place as many patches as needed.\n"
-            "3. Click Export Current Patches to save all "
-            "rectangles from this scan.\n"
-            "4. Use Previous Scan and Next Scan to move "
-            "between CZI files.\n"
-            "5. Click Done when patch selection is complete."
-        )
-        instructions.setWordWrap(True)
-        layout.addWidget(instructions)
-
-        self.scan_label = QLabel()
-        self.scan_label.setWordWrap(True)
-        layout.addWidget(self.scan_label)
-
-        self.selection_label = QLabel()
-        layout.addWidget(self.selection_label)
-
-        self.status_label = QLabel("")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-
-        export_button = QPushButton(
-            "Export Current Patches"
-        )
-        export_button.clicked.connect(
-            self.patch_frame.export_current_patches
-        )
-        layout.addWidget(export_button)
-
-        clear_button = QPushButton(
-            "Clear Unexported Rectangles"
-        )
-        clear_button.clicked.connect(
-            self.patch_frame.clear_rectangles
-        )
-        layout.addWidget(clear_button)
-
-        navigation_layout = QHBoxLayout()
-
-        self.previous_button = QPushButton(
-            "Previous Scan"
-        )
-        self.previous_button.clicked.connect(
-            self.patch_frame.previous_czi
-        )
-        navigation_layout.addWidget(
-            self.previous_button
-        )
-
-        self.next_button = QPushButton(
-            "Next Scan"
-        )
-        self.next_button.clicked.connect(
-            self.patch_frame.next_czi
-        )
-        navigation_layout.addWidget(
-            self.next_button
-        )
-
-        layout.addLayout(navigation_layout)
-
-        done_button = QPushButton("Done")
-        done_button.clicked.connect(
-            self.patch_frame.close_napari
-        )
-        layout.addWidget(done_button)
-
-        self.update_scan_label()
-        self.update_navigation_buttons()
-        self.update_selection_label()
-
-    def update_scan_label(self):
-        czi_list = self.patch_frame.get_czi_list()
-        index = self.patch_frame.current_czi_index
-        czi_path = czi_list[index]
-
-        self.scan_label.setText(
-            f"Current scan: {index + 1} of {len(czi_list)}\n"
-            f"{czi_path.name}"
-        )
-
-    def update_navigation_buttons(self):
-        czi_list = self.patch_frame.get_czi_list()
-        index = self.patch_frame.current_czi_index
-
-        self.previous_button.setEnabled(index > 0)
-        self.next_button.setEnabled(
-            index < len(czi_list) - 1
-        )
-
-    def update_selection_label(self):
-        layer = self.patch_frame.rectangle_layer
-
-        selection_count = (
-            len(layer.data)
-            if layer is not None
-            else 0
-        )
-
-        self.selection_label.setText(
-            f"Unexported selections: {selection_count}"
-        )
-
-    def set_status(self, message: str):
-        self.status_label.setText(message)
-
-
-class PlaceholderFrame(ct.CTkFrame):
-    def __init__(self, master):
-        super().__init__(None)
-
 class Frames:
     def __init__(self, master: "App"):
-        self.folder_select_frame = FolderSelectFrame(
-            master,
-            "Select Main Directory\n(must be empty)",
-        )
-
-        self.czi_select_frame = CZISelectFrame(
-            master,
-            "Select CZI Directory",
-        )
-
-        self.get_patches_frame = GetPatchesFrame(
-            master=master,
-            text="Select Training Patches",
-            root_dir_getter=lambda: self.folder_select_frame.dir,
-            czi_list_getter=lambda: self.czi_select_frame.czi_list,
-        )
-
-        self.frame_list: list[ct.CTkFrame] = [
-            self.folder_select_frame,
-            self.czi_select_frame,
-            self.get_patches_frame,
+        self.master = master
+        self.frame_factories: list[Callable[[], ct.CTkFrame]] = [
+            lambda: FolderSelectFrame(
+                master,
+                "Select Main Directory\n(must be empty)",
+            ),
+            lambda: CZISelectFrame(master, "Select CZI Directory"),
+            lambda: GetPatchesFrame(
+                master=master,
+                text="Select Training Patches",
+                root_dir_getter=lambda: self.get_frame(0).dir,
+                czi_list_getter=lambda: self.get_frame(1).czi_list,
+            ),
         ]
+        self.frames: dict[int, ct.CTkFrame] = {}
+
+    def __len__(self):
+        return len(self.frame_factories)
+
+    def get_frame(self, index: int) -> ct.CTkFrame:
+        if index not in self.frames:
+            self.frames[index] = self.frame_factories[index]()
+
+        return self.frames[index]
 
 
 class App(ct.CTk):
@@ -1115,8 +1105,8 @@ class App(ct.CTk):
         self.forward.grid(row=1, column=1, padx=(5, 10), pady=(0,20), sticky="ew")
         self.backward.grid(row=1, column=0, padx=(10, 5), pady=(0, 20), sticky="ew")
 
-        self.frame_list_: list[ct.CTkFrame] = Frames(self).frame_list
-        self.current_frame: tuple[int, ct.CTkFrame] = (-1, PlaceholderFrame(self))
+        self.frames = Frames(self)
+        self.current_frame: tuple[int, ct.CTkFrame | None] = (-1, None)
 
         self.initialize_frame(direction="forward")
 
@@ -1130,14 +1120,15 @@ class App(ct.CTk):
         step = 1 if direction == "forward" else -1
         new_index = self.current_frame[0] + step
 
-        if not 0 <= new_index < len(self.frame_list_):
+        if not 0 <= new_index < len(self.frames):
             return
 
-        self.current_frame[1].grid_remove()
+        if self.current_frame[1] is not None:
+            self.current_frame[1].grid_remove()
 
         self.current_frame = (
             new_index,
-            self.frame_list_[new_index],
+            self.frames.get_frame(new_index),
         )
 
         self.current_frame[1].grid(
@@ -1151,7 +1142,7 @@ class App(ct.CTk):
             state="disabled" if new_index == 0 else "normal"
         )
 
-        if new_index == len(self.frame_list_) - 1:
+        if new_index == len(self.frames) - 1:
             self.forward.configure(state="disabled")
         elif isinstance(self.current_frame[1], FolderSelectFrame):
             self.forward.configure(
